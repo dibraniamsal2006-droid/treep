@@ -14,6 +14,7 @@ import 'package:shared_preferences/shared_preferences.dart';
 import '../models/trip_candidate.dart';
 import '../services/alarm_service.dart';
 import '../services/matching_service.dart';
+import '../services/transport_service.dart';
 import 'settings_screen.dart';
 
 enum _PullUpFooterState { idle, loading, exhausted }
@@ -62,10 +63,16 @@ class _TreepHomeState extends State<TreepHome> {
   bool _sleepOverlayShowing = false;
   Timer? _sleepOverlayTimer;
   static const int _maxPickerHorizonHours = 6;
+  late final TransportService _transportService;
 
   @override
   void initState() {
     super.initState();
+    _transportService = TransportService(
+      trace: _trace,
+      traceCandidates: _traceStageCandidates,
+      upcomingWindowHoursProvider: () => _upcomingWindowHours,
+    );
     _loadPrefs();
   }
 
@@ -206,23 +213,6 @@ class _TreepHomeState extends State<TreepHome> {
       _sleepOverlayShowing = false;
     });
   }
-  static const Duration _gtfsRtMinInterval = Duration(seconds: 13);
-  static const Duration _gtfsRtFeedCacheTtl = Duration(seconds: 20);
-  DateTime? _lastGtfsRtCallAt;
-  Future<http.Response>? _gtfsRtInFlight;
-
-  // Cache the last parsed feed briefly so “Test feed” + “Start tracking” doesn’t double-hit the rate limit.
-  FeedMessage? _cachedFeed;
-  DateTime? _cachedFeedAt;
-
-  // stop_id → human station name (cached). This is a temporary mapping using transport.opendata.ch.
-  // Later we can replace with local GTFS stops.txt for speed and reliability.
-  final Map<String, String> _stopNameCache = {}; // canonStopId -> name
-  final Map<String, Future<void>> _stopNameInFlight = {}; // dedupe requests
-  // Optional static GTFS route_short_name lookup (route_id -> short name).
-  // Keep empty by default; if populated later, train matching will use it.
-  final Map<String, String> _routeShortNameByRouteId = {};
-
   String _hhmm(DateTime dt) {
     final h = dt.hour.toString().padLeft(2, '0');
     final m = dt.minute.toString().padLeft(2, '0');
@@ -347,123 +337,11 @@ class _TreepHomeState extends State<TreepHome> {
 
   Future<TripCandidate?> _refreshCandidateEta(TripCandidate c) async {
     _traceCandidate('Live-update start', c, source: 'refresh-input');
-    final hasStableTripKey = c.startDate.isNotEmpty || c.startTime.isNotEmpty;
-
-    // 1) GTFS-RT Refresh (wenn TripKey stabil ist)
-    if (hasStableTripKey) {
-      final feed = await _fetchGtfsRtFeed();
-      final destCanon = _normalizeStopId(c.stopId) ?? c.stopId;
-      final now = DateTime.now();
-
-      for (final e in feed.entity) {
-        if (!e.hasTripUpdate()) continue;
-        final tu = e.tripUpdate;
-        final trip = tu.trip;
-
-        final tripIdMatch = trip.tripId.isNotEmpty && trip.tripId == c.tripId;
-        final keyMatch = (!tripIdMatch) &&
-            trip.routeId == c.routeId &&
-            (c.startDate.isEmpty || trip.startDate == c.startDate) &&
-            (c.startTime.isEmpty || trip.startTime == c.startTime);
-
-        if (!tripIdMatch && !keyMatch) continue;
-
-        final upcoming = <StopEta>[];
-        StopEta? matched;
-        StopEta? terminal;
-
-        for (final stu in tu.stopTimeUpdate) {
-          final stopIdRaw = stu.stopId;
-          if (stopIdRaw.isEmpty) continue;
-
-          final stopCanon = _normalizeStopId(stopIdRaw);
-          if (stopCanon == null) continue;
-
-          final arrivalTime = stu.hasArrival() ? stu.arrival.time.toInt() : 0;
-          final departureTime = stu.hasDeparture() ? stu.departure.time.toInt() : 0;
-          final etaSec = arrivalTime != 0 ? arrivalTime : departureTime;
-          if (etaSec == 0) continue;
-
-          final etaLocal = DateTime.fromMillisecondsSinceEpoch(
-            etaSec * 1000,
-            isUtc: true,
-          ).toLocal();
-
-          if (etaLocal.isBefore(now.subtract(const Duration(minutes: 2)))) continue;
-
-          final arrivalDelay = stu.hasArrival() ? stu.arrival.delay.toInt() : 0;
-          final departureDelay = stu.hasDeparture() ? stu.departure.delay.toInt() : 0;
-          final delaySeconds = arrivalDelay != 0 ? arrivalDelay : departureDelay;
-
-          final stop = StopEta(
-            stopIdRaw: stopIdRaw,
-            stopIdCanon: stopCanon,
-            etaLocal: etaLocal,
-            delaySeconds: delaySeconds,
-          );
-
-          upcoming.add(stop);
-
-          if (_stopIdMatches(stopCanon, destCanon) && matched == null) {
-            matched = stop;
-          }
-        }
-
-        if (upcoming.isEmpty) return null;
-        upcoming.sort((a, b) => a.etaLocal.compareTo(b.etaLocal));
-        terminal = upcoming.last;
-
-        final chosenStop = matched ?? upcoming.first;
-
-        final refreshed = TripCandidate(
-          tripId: c.tripId,
-          routeId: c.routeId,
-          startDate: c.startDate,
-          startTime: c.startTime,
-          stopId: chosenStop.stopIdRaw,
-          etaLocal: chosenStop.etaLocal,
-          delaySeconds: chosenStop.delaySeconds,
-          displayTrain: c.displayTrain,
-          vehicleLabel: c.vehicleLabel,
-          destinationMatched: matched != null,
-          upcomingStops: upcoming.take(40).toList(),
-          terminalStopId: terminal.stopIdRaw,
-          terminalStopIdCanon: terminal.stopIdCanon,
-        );
-        _traceCandidate('Live-update GTFS result', refreshed, source: 'refresh-gtfs');
-        return refreshed;
-      }
-      return null;
+    final refreshed = await _transportService.refreshCandidateEta(c);
+    if (refreshed != null) {
+      _traceCandidate('Live-update service result', refreshed, source: 'refresh-service');
     }
-
-    // 2) Stationboard Refresh (wenn kein stabiler TripKey)
-    final destCanon = _normalizeStopId(c.stopId) ?? c.stopId;
-    final arrivals = await _fallbackArrivalsAtDestination(
-      trainQuery: c.displayTrain,
-      destStopIdCanons: <String>[destCanon],
-      limit: 100,
-    );
-
-    if (arrivals.isEmpty) return null;
-
-    final myDirKey = _directionKey(c);
-    final sameDir = arrivals.where((x) => _directionKey(x) == myDirKey).toList();
-    final pool = sameDir.isNotEmpty ? sameDir : arrivals;
-
-    pool.sort((a, b) => a.etaLocal.compareTo(b.etaLocal));
-
-    TripCandidate best = pool.first;
-    int bestDiff = best.etaLocal.difference(c.etaLocal).inSeconds.abs();
-    for (final x in pool.take(_upcomingTripsLimit)) {
-      final d = x.etaLocal.difference(c.etaLocal).inSeconds.abs();
-      if (d < bestDiff) {
-        best = x;
-        bestDiff = d;
-      }
-    }
-
-    _traceCandidate('Live-update fallback result', best, source: 'refresh-fallback');
-    return best;
+    return refreshed;
   }
 
   Future<void> _rescheduleAlarmWith(TripCandidate updated, {required String reason}) async {
@@ -760,13 +638,6 @@ class _TreepHomeState extends State<TreepHome> {
     }
   }
 
-  bool _looksInternalStopTokenViaService(String value) {
-    return MatchingService.looksInternalStopToken(
-      value,
-      normalizeStopId: _normalizeStopId,
-    );
-  }
-
   List<TripCandidate> _dropPastCandidates(List<TripCandidate> input, {required String stage}) {
     final now = DateTime.now();
     final cutoff = now.subtract(const Duration(seconds: 60));
@@ -820,88 +691,12 @@ class _TreepHomeState extends State<TreepHome> {
     return (filtered: filtered, fresh: fresh, deduped: deduped);
   }
 
-  Future<String> _resolveFallbackTerminalLabel({
-    required String derivedTerminalRaw,
-    required String toRaw,
-    required String destName,
-  }) async {
-    var terminalName = derivedTerminalRaw.trim();
-    final to = toRaw.trim();
-    final dest = destName.trim();
-
-    // 1) explicit readable terminal station name
-    if (terminalName.isNotEmpty && !_looksInternalStopTokenViaService(terminalName)) {
-      return terminalName;
-    }
-
-    // 2) readable destination text from `to`
-    if (to.isNotEmpty && !_looksInternalStopTokenViaService(to)) {
-      return to;
-    }
-
-    // 3) stop-name cache lookup from any internal-looking token
-    final lookupRaw = terminalName.isNotEmpty ? terminalName : to;
-    if (lookupRaw.isNotEmpty) {
-      final canon = _normalizeStopId(lookupRaw);
-      if (canon != null) {
-        await _ensureStopName(canon);
-        final cached = (_stopNameCache[canon] ?? '').trim();
-        if (cached.isNotEmpty && cached != 'Unknown') {
-          return cached;
-        }
-      }
-    }
-
-    // 4) absolute last resort: destination name, then raw id/text
-    if (dest.isNotEmpty) return dest;
-    if (terminalName.isNotEmpty) return terminalName;
-    return to;
-  }
-
   int _pickerTakePerDirection() {
     return _upcomingTripsLimit < 3 ? 3 : _upcomingTripsLimit;
   }
 
   bool _stopIdMatches(String stopCanon, String destCanon) {
-    // First try strict normalized stop-id equality.
-    final a = _normalizeStopId(stopCanon) ?? stopCanon;
-    final b = _normalizeStopId(destCanon) ?? destCanon;
-    if (a == b) return true;
-
-    // Fallback: some feeds use sibling/main/platform stop_ids for the same station
-    // (for example a resolved destination id vs a GTFS/stationboard stop id).
-    // If we already know both station names and they normalize to the same base token,
-    // treat them as the same logical station.
-    final aName = (_stopNameCache[a] ?? '').trim();
-    final bName = (_stopNameCache[b] ?? '').trim();
-    if (aName.isEmpty || bName.isEmpty) return false;
-
-    final aNorm = MatchingService.normalizeStationToken(aName);
-    final bNorm = MatchingService.normalizeStationToken(bName);
-    if (aNorm.isEmpty || bNorm.isEmpty) return false;
-
-    return aNorm == bNorm;
-  }
-
-  String _tripShortNameFromTripDescriptor(dynamic tripDescriptor) {
-    try {
-      final raw = (tripDescriptor as dynamic).tripShortName;
-      if (raw is String) return raw;
-    } catch (_) {}
-    return '';
-  }
-
-  String _routeShortNameFromRouteId(String routeId) {
-    if (routeId.isEmpty) return '';
-    return _routeShortNameByRouteId[routeId] ?? '';
-  }
-
-  bool _isBaselMainStationStopHintViaService(StopEta stop) {
-    return MatchingService.isBaselMainStationStopHint(
-      stop,
-      normalizeStopId: _normalizeStopId,
-      stopNameCache: _stopNameCache,
-    );
+    return _transportService.stopIdMatches(stopCanon, destCanon);
   }
 
   TripCandidate? _bridgeFallbackCandidateToGtfs({
@@ -1042,128 +837,10 @@ class _TreepHomeState extends State<TreepHome> {
     String trainQuery,
     String destName,
   ) async {
-    // Get trips for this train, even if we don't know the destination stop_id yet.
-    // We pass a nonsense destQuery so we don't accidentally match everything.
-    final trainOnly = _findCandidates(
-      feed,
-      trainQuery,
-      '0',
-      requireDestinationMatch: false,
-    );
-
-    if (trainOnly.isEmpty) return const <TripCandidate>[];
-
-    // We'll resolve station names for a limited number of stops to keep network calls small.
-    const maxCandidates = 8;
-    const maxStopsPerCandidate = 30;
-    const maxLookupsTotal = 25;
-
-    int lookups = 0;
-    final out = <TripCandidate>[];
-
-    for (final c in trainOnly.take(maxCandidates)) {
-      StopEta? matched;
-
-      for (final s in c.upcomingStops.take(maxStopsPerCandidate)) {
-        // Resolve name if needed.
-        final canon = s.stopIdCanon;
-        if (!_stopNameCache.containsKey(canon) && lookups < maxLookupsTotal) {
-          lookups++;
-          await _ensureStopName(canon);
-        }
-
-        final name = _stopNameCache[canon];
-        if (name == null || name == 'Unknown') continue;
-
-        if (MatchingService.stationNameMatchesQuery(name, destName)) {
-          matched = s;
-          break;
-        }
-      }
-
-      if (matched != null) {
-        out.add(c.copyWithDestination(matched));
-      }
-
-      // If we already have multiple good matches, stop early.
-      if (out.length >= 10) break;
-    }
-
-    out.sort((a, b) => a.etaLocal.compareTo(b.etaLocal));
-    return out;
+    return _transportService.findCandidatesByTrainAndDestinationName(feed, trainQuery, destName);
   }
   Future<void> _ensureStopName(String canonStopId) async {
-    if (canonStopId.isEmpty) return;
-    if (_stopNameCache.containsKey(canonStopId)) return;
-
-    // Deduplicate parallel requests.
-    if (_stopNameInFlight.containsKey(canonStopId)) {
-      await _stopNameInFlight[canonStopId];
-      return;
-    }
-
-    final fut = () async {
-      try {
-        final id = MatchingService.toOpendataId(canonStopId);
-
-        http.Response res;
-
-        // First try exact id lookup.
-        final uri = Uri.parse(
-          'https://transport.opendata.ch/v1/locations?id=${Uri.encodeComponent(id)}',
-        );
-        res = await http.get(uri).timeout(const Duration(seconds: 8));
-
-        // Some stop_ids don't resolve via `?id=` (especially terminal/platform variants).
-        // Fallback to a query lookup before giving up.
-        if (res.statusCode != 200) {
-          final altUri = Uri.parse(
-            'https://transport.opendata.ch/v1/locations?query=${Uri.encodeComponent(id)}&type=station',
-          );
-          res = await http.get(altUri).timeout(const Duration(seconds: 8));
-        }
-
-        if (res.statusCode != 200) {
-          _stopNameCache[canonStopId] = 'Unknown';
-          return;
-        }
-
-        final decoded = json.decode(
-          utf8.decode(res.bodyBytes, allowMalformed: true),
-        );
-        final stations = (decoded is Map) ? decoded['stations'] : null;
-        if (stations is! List || stations.isEmpty) {
-          _stopNameCache[canonStopId] = 'Unknown';
-          return;
-        }
-
-        // Try to pick the station whose normalized id matches exactly.
-        Map? best;
-        for (final s in stations) {
-          if (s is! Map) continue;
-          final idRaw = (s['id'] ?? '').toString();
-          final idCanon = _normalizeStopId(idRaw);
-          if (idCanon == canonStopId) {
-            best = s;
-            break;
-          }
-        }
-        best ??= stations.first is Map ? stations.first as Map : null;
-        if (best == null) {
-          _stopNameCache[canonStopId] = 'Unknown';
-          return;
-        }
-
-        final name = (best['name'] ?? '').toString();
-        _stopNameCache[canonStopId] = name.isNotEmpty ? name : 'Unknown';
-      } catch (_) {
-        _stopNameCache[canonStopId] = 'Unknown';
-      }
-    }();
-
-    _stopNameInFlight[canonStopId] = fut;
-    await fut;
-    _stopNameInFlight.remove(canonStopId);
+    await _transportService.ensureStopName(canonStopId);
   }
 
   Future<void> _warmStopNamesForCandidates(List<TripCandidate> candidates) async {
@@ -1181,17 +858,13 @@ class _TreepHomeState extends State<TreepHome> {
     }
 
     if (ids.isEmpty) return;
-
-    await Future.wait(ids.map(_ensureStopName));
+    await _transportService.warmStopNamesForCandidates(candidates);
 
     if (mounted) setState(() {});
   }
 
   String _stopLabel(String rawStopId) {
-    final canon = _normalizeStopId(rawStopId) ?? rawStopId;
-    final name = _stopNameCache[canon];
-    if (name == null || name == 'Unknown') return canon;
-    return '$name ($canon)';
+    return _transportService.stopLabel(rawStopId);
   }
 
   List<TripCandidate> _dedupeCandidatesViaService(List<TripCandidate> input) {
@@ -2226,580 +1899,27 @@ class _TreepHomeState extends State<TreepHome> {
     }
   }
 
-  Future<http.Response> _getGtfsRtResponse() async {
-    final key = dotenv.env['OPENTRANSPORTDATA_API_KEY'];
-    if (key == null || key.trim().isEmpty || key == 'YOUR_API_KEY') {
-      throw Exception('No real API key set in .env yet.');
-    }
+  Future<http.Response> _getGtfsRtResponse() async => _transportService.getGtfsRtResponse();
 
-    // Deduplicate concurrent calls (e.g. user taps quickly or multiple buttons).
-    if (_gtfsRtInFlight != null) {
-      return _gtfsRtInFlight!;
-    }
+  Future<FeedMessage> _fetchGtfsRtFeed() async => _transportService.fetchGtfsRtFeed();
 
-    final completer = Completer<http.Response>();
-    _gtfsRtInFlight = completer.future;
-
-    try {
-      // Throttle to respect rate limits.
-      final now = DateTime.now();
-      if (_lastGtfsRtCallAt != null) {
-        final elapsed = now.difference(_lastGtfsRtCallAt!);
-        if (elapsed < _gtfsRtMinInterval) {
-          await Future.delayed(_gtfsRtMinInterval - elapsed);
-        }
-      }
-
-      final uri = Uri.parse('https://api.opentransportdata.swiss/la/gtfs-rt');
-
-      http.Response res = await http
-          .get(
-            uri,
-            headers: {
-              'Authorization': 'Bearer $key',
-              'Accept':
-                  'application/x-protobuf, application/octet-stream;q=0.9, */*;q=0.8',
-            },
-          )
-          .timeout(const Duration(seconds: 12));
-
-      // Record call time after the request finishes (counts against rate limit).
-      _lastGtfsRtCallAt = DateTime.now();
-
-      // If we hit rate-limit, wait then retry once.
-      if (res.statusCode == 429) {
-        final retryAfterRaw = res.headers['retry-after'];
-        final retrySeconds = int.tryParse((retryAfterRaw ?? '').trim());
-        final wait = Duration(seconds: retrySeconds ?? 60);
-        await Future.delayed(wait);
-
-        res = await http
-            .get(
-              uri,
-              headers: {
-                'Authorization': 'Bearer $key',
-                'Accept':
-                    'application/x-protobuf, application/octet-stream;q=0.9, */*;q=0.8',
-              },
-            )
-            .timeout(const Duration(seconds: 12));
-
-        _lastGtfsRtCallAt = DateTime.now();
-      }
-
-      completer.complete(res);
-    } catch (e, st) {
-      completer.completeError(e, st);
-    } finally {
-      _gtfsRtInFlight = null;
-    }
-
-    return completer.future;
-  }
-
-  Future<FeedMessage> _fetchGtfsRtFeed() async {
-    // If we fetched very recently, reuse the parsed feed to avoid 429.
-    if (_cachedFeed != null && _cachedFeedAt != null) {
-      final age = DateTime.now().difference(_cachedFeedAt!);
-      if (age <= _gtfsRtFeedCacheTtl) {
-        return _cachedFeed!;
-      }
-    }
-
-    final res = await _getGtfsRtResponse();
-
-    if (res.statusCode != 200) {
-      throw Exception(
-        'GTFS-RT HTTP ${res.statusCode} (${res.headers['content-type'] ?? 'unknown'})',
-      );
-    }
-
-    final feed = FeedMessage.fromBuffer(res.bodyBytes);
-    _cachedFeed = feed;
-    _cachedFeedAt = DateTime.now();
-    return feed;
-  }
-  String _deriveTerminalNameFromArrivalItem(Map item, String destStopCanon) {
-    final to = (item['to'] ?? '').toString().trim();
-    final passList = item['passList'];
-    final stop = item['stop'];
-    final destStation = stop is Map ? stop['station'] : null;
-    final destName = (destStation is Map ? destStation['name'] : '').toString().trim();
-
-    if (passList is List && passList.isNotEmpty) {
-      String? nameAfterDest;
-      String? fallbackLastName;
-      bool destSeen = false;
-
-      for (final p in passList) {
-        if (p is! Map) continue;
-        final st = p['station'];
-        if (st is! Map) continue;
-
-        final name = (st['name'] ?? '').toString().trim();
-        final idRaw = (st['id'] ?? '').toString();
-        final canon = _normalizeStopId(idRaw);
-
-        if (destSeen && name.isNotEmpty) {
-          nameAfterDest = name;
-          break;
-        }
-
-        if (!destSeen && canon == destStopCanon) {
-          destSeen = true;
-          continue;
-        }
-
-        if (!destSeen && name.isNotEmpty) {
-          fallbackLastName = name;
-        }
-      }
-
-      if (nameAfterDest != null) {
-        if (kDebugMode) {
-          debugPrint('[Treep][Arrivals] Terminal via passList: $nameAfterDest for $destStopCanon');
-        }
-        return nameAfterDest;
-      }
-
-      if (!destSeen && fallbackLastName != null && fallbackLastName.isNotEmpty) {
-        return fallbackLastName;
-      }
-    }
-
-    if (to.isNotEmpty && to.toLowerCase() != destName.toLowerCase()) {
-      return to;
-    }
-    return destName;
-  }
   Future<List<TripCandidate>> _fallbackArrivalsAtDestination({
     required String trainQuery,
     required List<String> destStopIdCanons,
     String? destNameQuery,
     int limit = 100,
   }) async {
-    final tq = _normalizeTrainToken(trainQuery);
-    final hasTrainFilter = tq.isNotEmpty;
-    _trace(
-      'Destination-fallback start destinationQuery="${destNameQuery ?? ""}" trainQueryNorm="$tq" trainFilter=$hasTrainFilter',
+    return _transportService.fallbackArrivalsAtDestination(
+      trainQuery: trainQuery,
+      destStopIdCanons: destStopIdCanons,
+      destNameQuery: destNameQuery,
+      limit: limit,
     );
-
-    // Try multiple stop_ids for the same station name (parent station vs platforms, etc.)
-    // and merge results.
-    final uniqueStops = <String>{};
-    final maxStops = hasTrainFilter ? 4 : 16;
-    for (final s in destStopIdCanons) {
-      final canon = _normalizeStopId(s) ?? s;
-      if (canon.isNotEmpty) uniqueStops.add(canon);
-      if (uniqueStops.length >= maxStops) break; // keep requests small
-    }
-    if (uniqueStops.isEmpty) return const <TripCandidate>[];
-
-    // Use a stable order (Set iteration order is not guaranteed).
-    var orderedStops = uniqueStops.toList()..sort();
-
-    // In broad destination fallback (trainFilter=false), widen with sibling/main station ids
-    // from the destination query to avoid underfetching at big hubs (e.g. Olten variants).
-    if (!hasTrainFilter && (destNameQuery ?? '').trim().isNotEmpty) {
-      final extraResolved = await _resolveStopIdsFromName(destNameQuery!);
-      for (final raw in extraResolved) {
-        final canon = _normalizeStopId(raw) ?? raw;
-        if (canon.isNotEmpty) uniqueStops.add(canon);
-        if (uniqueStops.length >= maxStops) break;
-      }
-      orderedStops = uniqueStops.toList()..sort();
-    }
-    _trace(
-      'Destination-fallback fetch destinationQuery="${destNameQuery ?? ""}" '
-      'resolvedStopIds=[${orderedStops.join(",")}] limit=$limit',
-    );
-
-    // Warm cache so labels look nice.
-    await Future.wait(orderedStops.map(_ensureStopName));
-    final stopLabels = orderedStops.map((id) => _stopLabel(id)).join(' | ');
-    _trace('Destination-fallback stop names=$stopLabels');
-
-    String normText(String s) {
-      return s
-          .toLowerCase()
-          .replaceAll('ü', 'u')
-          .replaceAll('ä', 'a')
-          .replaceAll('ö', 'o')
-          .replaceAll(RegExp(r'[^a-z0-9 ]+'), ' ')
-          .replaceAll(RegExp(r'\s+'), ' ')
-          .trim();
-    }
-
-    final queryNorm = normText(destNameQuery ?? '');
-    bool queryHasAny(List<String> toks) => toks.any((t) => queryNorm.contains(t));
-
-    // Pick one canonical destination id so duplicates across platform/child stop_ids collapse to the main station.
-    String primaryDestCanon = orderedStops.first;
-    double bestScore = -1e9;
-    for (final canon in orderedStops) {
-      final stopName = (_stopNameCache[canon] ?? '').trim();
-      final stopNorm = normText(stopName);
-      double score = 0;
-
-      if (queryNorm.isNotEmpty) {
-        if (stopNorm == queryNorm) {
-          score += 120;
-        } else if (stopNorm.startsWith(queryNorm)) {
-          score += 70;
-        } else if (stopNorm.contains(queryNorm)) {
-          score += 45;
-        }
-      }
-
-      if (stopNorm.contains('bahnhof') || stopNorm.contains(' hb ') || stopNorm.endsWith(' hb') || stopNorm.contains(' sbb ')) {
-        score += 8;
-      }
-
-      final qualifierGroups = <List<String>>[
-        <String>['west'],
-        <String>['allmend'],
-        <String>['sud', 'sued'],
-        <String>['zentrum'],
-      ];
-      for (final group in qualifierGroups) {
-        final hasQualifier = group.any((t) => stopNorm.contains(t));
-        if (!hasQualifier) continue;
-        if (!queryHasAny(group)) {
-          score -= 30;
-        }
-      }
-
-      if (score > bestScore) {
-        bestScore = score;
-        primaryDestCanon = canon;
-      }
-    }
-
-    // If the user typed a plain base station name (e.g. "Solothurn"), do NOT fetch stationboards
-    // for sub-stations like "Solothurn West" / "Solothurn Allmend".
-    // Only widen to multiple stop_ids when the query explicitly contains such qualifiers.
-    final qualifierTokens = <String>['west', 'allmend', 'sud', 'sued', 'zentrum'];
-    final queryNormForStops = queryNorm; // already normalized above
-    final queryWantsQualifier = qualifierTokens.any((t) => queryNormForStops.contains(t));
-
-    final List<String> stopsToFetch = !hasTrainFilter
-        ? orderedStops
-        : (queryWantsQualifier ? orderedStops : <String>[primaryDestCanon]);
-    _trace('Destination-fallback fetch-expanded stopIds=${stopsToFetch.join(",")}');
-
-    final now = DateTime.now();
-    // Keep only plausible near-future arrivals to avoid wild “time jumps”.
-    final lowerBound = now.subtract(const Duration(seconds: 15));
-    final windowEnd = now.add(const Duration(hours: _maxPickerHorizonHours));
-    _trace('Upcoming window active: ${_upcomingWindowHours}h');
-    _trace('Upcoming window max horizon: ${_maxPickerHorizonHours}h');
-    _trace(
-      'Destination-fallback window lowerBound=${lowerBound.toIso8601String()} '
-      'windowEnd=${windowEnd.toIso8601String()}',
-    );
-
-    // Human label for fallback direction display.
-    final destName = _stopNameCache[primaryDestCanon] ?? '';
-
-    // Deduplicate across multiple stop_ids (platform vs parent station) and keep the “best” version.
-    final allByKey = <String, TripCandidate>{};
-    final filteredByKey = <String, TripCandidate>{};
-
-    bool mergeCandidate(Map<String, TripCandidate> map, String key, TripCandidate cand) {
-      final prev = map[key];
-      if (prev == null) {
-        map[key] = cand;
-        return true;
-      }
-      // Prefer entries that actually have delay information.
-      if (prev.delaySeconds == 0 && cand.delaySeconds != 0) {
-        map[key] = cand;
-        return true;
-      }
-      // Prefer the larger (absolute) delay if both have one.
-      if (cand.delaySeconds.abs() > prev.delaySeconds.abs()) {
-        map[key] = cand;
-        return true;
-      }
-      // Otherwise keep the first.
-      return false;
-    }
-
-    for (final destStopIdCanon in stopsToFetch) {
-      final stationId = MatchingService.toOpendataId(destStopIdCanon);
-
-      final uri = Uri.parse(
-        'https://transport.opendata.ch/v1/stationboard'
-        '?id=${Uri.encodeComponent(stationId)}'
-        '&type=arrival'
-        '&limit=$limit',
-      );
-
-      http.Response res;
-      try {
-        res = await http.get(uri).timeout(const Duration(seconds: 10));
-      } catch (_) {
-        continue;
-      }
-      if (res.statusCode != 200) continue;
-
-      final decoded = json.decode(
-        utf8.decode(res.bodyBytes, allowMalformed: true),
-      );
-
-      final list = (decoded is Map) ? decoded['stationboard'] : null;
-      if (list is! List || list.isEmpty) continue;
-      _trace('Destination-fallback raw fetch stopId=$destStopIdCanon count=${list.length}');
-
-      for (final item in list) {
-        if (item is! Map) continue;
-
-        final name = (item['name'] ?? '').toString(); // e.g. "S 20" / "IC 5"
-        final category = (item['category'] ?? '').toString();
-        final number = (item['number'] ?? '').toString();
-        final catNum = (category + number).trim(); // e.g. "S20"
-
-        final normName = _normalizeTrainToken(name);
-        final normCatNum = _normalizeTrainToken(catNum);
-
-        final matchesTrain = !hasTrainFilter ||
-            MatchingService.matchesTrainQuery(tq, normCatNum) ||
-            MatchingService.matchesTrainQuery(tq, normName);
-
-        final stop = item['stop'];
-        if (stop is! Map) continue;
-
-        final Map stopMap = stop;
-        final Map? prog = (stopMap['prognosis'] is Map) ? stopMap['prognosis'] as Map : null;
-
-        int? asInt(dynamic v) {
-          if (v == null) return null;
-          if (v is int) return v;
-          if (v is num) return v.toInt();
-          return int.tryParse(v.toString());
-        }
-
-        DateTime? parseIsoFlexible(String? value) {
-          if (value == null) return null;
-          final s = value.trim();
-          if (s.isEmpty) return null;
-          try {
-            return DateTime.parse(s).toLocal();
-          } catch (_) {
-            return null;
-          }
-        }
-
-        // scheduled: prefer arrivalTimestamp (type=arrival) else departureTimestamp
-        final schedArrivalTs = asInt(stopMap['arrivalTimestamp']);
-        final schedDepartureTs = asInt(stopMap['departureTimestamp']);
-        final int? schedTs = schedArrivalTs ?? schedDepartureTs;
-        if (schedTs == null || schedTs <= 0) {
-          continue; // cannot compute delay without scheduled time
-        }
-        final schedLocal = DateTime.fromMillisecondsSinceEpoch(schedTs * 1000, isUtc: true).toLocal();
-
-        // realtime prognosis ISO: prefer arrival else departure
-        final String? progArrivalIso = prog == null ? null : prog['arrival']?.toString();
-        final String? progDepartureIso = prog == null ? null : prog['departure']?.toString();
-
-        final DateTime? progArrivalLocal = parseIsoFlexible(progArrivalIso);
-        final DateTime? progDepartureLocal = parseIsoFlexible(progDepartureIso);
-
-        DateTime? bestProg;
-        int bestAbs = 1 << 30;
-
-        void consider(DateTime? dt) {
-          if (dt == null) return;
-          final abs = (dt.difference(schedLocal).inSeconds).abs();
-          if (abs > 6 * 60 * 60) return; // ignore insane prognosis
-          if (abs < bestAbs) {
-            bestAbs = abs;
-            bestProg = dt;
-          }
-        }
-
-        // choose prognosis time that best matches this item's schedule
-        consider(progArrivalLocal);
-        consider(progDepartureLocal);
-
-        // ETA = realtime if present else scheduled
-        final etaLocal = bestProg ?? schedLocal;
-
-        if (!etaLocal.isAfter(lowerBound) || etaLocal.isAfter(windowEnd)) continue;
-
-        // delaySeconds always derived from eta - sched
-        final delaySeconds = etaLocal.difference(schedLocal).inSeconds;
-
-        final effectiveTs = etaLocal.toUtc().millisecondsSinceEpoch ~/ 1000;
-
-        final displayLine = catNum.isNotEmpty ? catNum : name; // e.g. "T8", "IR55"
-        final lineTrim = displayLine.trim();
-
-        // Display label: always show the public line id; only fall back to name if catNum is empty.
-        String display;
-        if (lineTrim.isNotEmpty) {
-          display = lineTrim;
-        } else {
-          final nameTrim = name.trim();
-          display = nameTrim.isNotEmpty ? nameTrim : 'Train';
-        }
-
-        // Deduplicate across multiple stop_ids and keep terminal/platform so big hubs don’t collapse wrongly.
-        final derivedTerminalRaw = _deriveTerminalNameFromArrivalItem(item, destStopIdCanon).trim();
-        final toRaw = (item['to'] ?? '').toString().trim();
-
-        final terminalName = await _resolveFallbackTerminalLabel(
-          derivedTerminalRaw: derivedTerminalRaw,
-          toRaw: toRaw,
-          destName: destName,
-        );
-
-        final terminalKey = MatchingService.normalizeStationToken(terminalName);
-
-        // Platform can differ and matters at big stations.
-        final platform = prog?['platform'] ?? stopMap['platform'];
-        final platformKey = (platform ?? '').toString().trim().toLowerCase();
-
-        final lineKey = lineTrim.isNotEmpty ? _normalizeTrainToken(lineTrim) : _normalizeTrainToken(display);
-        final key = '$effectiveTs|$lineKey|$terminalKey|$platformKey';
-
-        final fallbackTripId = <String>[
-          lineKey,
-          effectiveTs.toString(),
-          terminalKey,
-          platformKey,
-        ].join('_');
-
-        final cand = TripCandidate(
-          tripId: fallbackTripId,
-          routeId: lineTrim,
-          startDate: '',
-          startTime: '',
-          // IMPORTANT: use one canonical destination id so duplicates across platform stop_ids collapse.
-          stopId: primaryDestCanon,
-          etaLocal: etaLocal,
-          delaySeconds: delaySeconds,
-          displayTrain: display,
-          vehicleLabel: MatchingService.vehicleLabelFromDisplay(display),
-          destinationMatched: true,
-          upcomingStops: const <StopEta>[],
-          terminalStopId: terminalName.isNotEmpty ? terminalName : (item['to'] ?? '').toString(),
-          terminalStopIdCanon: '',
-        );
-
-        final storedAll = mergeCandidate(allByKey, key, cand);
-        final storedFiltered = matchesTrain ? mergeCandidate(filteredByKey, key, cand) : false;
-
-        if ((hasTrainFilter && storedFiltered) || (!hasTrainFilter && storedAll)) {
-          final terminalRendered = _terminalLabel(cand);
-          _trace(
-            'Fallback arrival candidate found tripId=${cand.tripId} displayTrain="${cand.displayTrain}" '
-            'stopId=${cand.stopId} etaLocal=${cand.etaLocal.toIso8601String()} delaySeconds=${cand.delaySeconds} '
-            'terminalRaw="$derivedTerminalRaw" terminalNorm="$terminalKey" platform="$platformKey" '
-            'terminalFinal="$terminalRendered"',
-          );
-        }
-      }
-    }
-
-    final all = allByKey.values.toList();
-    final filtered = filteredByKey.values.toList();
-
-    final out = hasTrainFilter ? filtered : all;
-    out.sort((a, b) => a.etaLocal.compareTo(b.etaLocal));
-    if (out.isNotEmpty) {
-      _trace(
-        'Destination-fallback merged broad count=${out.length} trainFilter=$hasTrainFilter '
-        'minEta=${out.first.etaLocal.toIso8601String()} maxEta=${out.last.etaLocal.toIso8601String()}',
-      );
-    } else {
-      _trace('Destination-fallback merged broad count=0 trainFilter=$hasTrainFilter minEta=none maxEta=none');
-    }
-    _traceStageCandidates(
-      'Destination-fallback merged sample trainFilter=$hasTrainFilter',
-      out,
-      max: 8,
-    );
-    return out.take(limit).toList();
   }
 
-Future<List<String>> _resolveStopIdsFromName(String query) async {
-  final uri = Uri.parse(
-    'https://transport.opendata.ch/v1/locations?query=${Uri.encodeComponent(query)}&type=station',
-  );
+Future<List<String>> _resolveStopIdsFromName(String query) async => _transportService.resolveStopIdsFromName(query);
 
-  final res = await http.get(uri).timeout(const Duration(seconds: 10));
-  if (res.statusCode != 200) return const [];
-
-  final decoded = json.decode(
-    utf8.decode(res.bodyBytes, allowMalformed: true),
-  );
-  if (decoded is! Map) return const [];
-
-  final stations = decoded['stations'];
-  if (stations is! List || stations.isEmpty) return const [];
-
-  final q = query.trim().toLowerCase();
-
-  final scored = <({String canon, double score})>[];
-
-  for (final s in stations) {
-    if (s is! Map) continue;
-
-    final name = (s['name'] ?? '').toString();
-    final rawId = (s['id'] ?? '').toString();
-    final canon = _normalizeStopId(rawId);
-    if (canon == null) continue;
-
-    double score = 0;
-    if (canon.startsWith('85')) score += 5;
-
-    final n = name.toLowerCase();
-    if (n == q) score += 12;
-    if (n.startsWith(q)) score += 7;
-    if (n.contains(q)) score += 3;
-
-    final apiScore = s['score'];
-    if (apiScore is num) score += apiScore.toDouble();
-
-    scored.add((canon: canon, score: score));
-  }
-
-  if (scored.isEmpty) return const [];
-
-  scored.sort((a, b) => b.score.compareTo(a.score));
-
-  final out = <String>[];
-  final seen = <String>{};
-  for (final x in scored) {
-    if (seen.add(x.canon)) out.add(x.canon);
-    if (out.length >= 8) break;
-  }
-
-  return out;
-}
-
-  String? _normalizeStopId(String raw) {
-    // Examples: "8503000", "008503000", or URN-like strings.
-    final digits = RegExp(r'\d+').allMatches(raw).map((m) => m.group(0)!).join();
-    if (digits.isEmpty) return null;
-
-    // Swiss stop IDs are typically 7 digits starting with 85.
-    if (digits.length >= 7) {
-      final tail7 = digits.substring(digits.length - 7);
-      if (tail7.startsWith('85')) return tail7;
-
-      for (int i = 0; i <= digits.length - 7; i++) {
-        final w = digits.substring(i, i + 7);
-        if (w.startsWith('85')) return w;
-      }
-
-      return tail7;
-    }
-
-    return digits;
-  }
+  String? _normalizeStopId(String raw) => _transportService.normalizeStopId(raw);
 
   List<TripCandidate> _findCandidates(
     FeedMessage feed,
@@ -2807,151 +1927,12 @@ Future<List<String>> _resolveStopIdsFromName(String query) async {
     String destQuery, {
     required bool requireDestinationMatch,
   }) {
-    final tq = _normalizeTrainToken(trainQuery);
-    final destCanon = _normalizeStopId(destQuery) ?? destQuery;
-
-    final now = DateTime.now();
-    final List<TripCandidate> out = [];
-
-    for (final e in feed.entity) {
-      if (!e.hasTripUpdate()) continue;
-
-      final tu = e.tripUpdate;
-      final trip = tu.trip;
-
-      final tripId = trip.tripId;
-      final routeId = trip.routeId;
-      final tripShortName = _tripShortNameFromTripDescriptor(trip);
-      final routeShortName = _routeShortNameFromRouteId(routeId);
-      final displayTrain = routeId.isNotEmpty ? routeId : tripId;
-
-      final displayNorm = _normalizeTrainToken(displayTrain);
-      final tripNorm = _normalizeTrainToken(tripId);
-      final routeNorm = _normalizeTrainToken(routeId);
-      final tripShortNorm = _normalizeTrainToken(tripShortName);
-      final routeShortNorm = _normalizeTrainToken(routeShortName);
-
-      final rawLabels = <String>[displayTrain, routeId, tripId, tripShortName, routeShortName];
-      final matchesTrain = tq.isEmpty || MatchingService.matchesTrainQueryTokenAware(trainQuery, rawLabels);
-      if (!matchesTrain) {
-        _trace(
-          'GTFS-RT reject reason=train_query_mismatch tripId="$tripId" routeId="$routeId" '
-          'startDate="${trip.startDate}" startTime="${trip.startTime}" '
-          'queryNorm="$tq" displayNorm="$displayNorm" routeNorm="$routeNorm" tripNorm="$tripNorm" '
-          'tripShortNorm="$tripShortNorm" routeShortNorm="$routeShortNorm"',
-        );
-        continue;
-      }
-      _trace(
-        'GTFS-RT match train queryNorm="$tq" routeNorm="$routeNorm" tripShortNorm="$tripShortNorm" '
-        'routeShortNorm="$routeShortNorm" tripId="$tripId"',
-      );
-
-      final List<StopEta> upcoming = [];
-      StopEta? matchedDest;
-      String? matchedStopIdRaw;
-
-      for (final stu in tu.stopTimeUpdate) {
-        final stopIdRaw = stu.stopId;
-        if (stopIdRaw.isEmpty) continue;
-
-        final stopCanon = _normalizeStopId(stopIdRaw);
-        if (stopCanon == null) continue;
-
-        final arrivalTime = stu.hasArrival() ? stu.arrival.time.toInt() : 0;
-        final departureTime = stu.hasDeparture() ? stu.departure.time.toInt() : 0;
-        final etaSec = arrivalTime != 0 ? arrivalTime : departureTime;
-        if (etaSec == 0) continue;
-
-        final etaLocal = DateTime.fromMillisecondsSinceEpoch(
-          etaSec * 1000,
-          isUtc: true,
-        ).toLocal();
-
-        if (etaLocal.isBefore(now.subtract(const Duration(minutes: 2)))) continue;
-
-        final arrivalDelay = stu.hasArrival() ? stu.arrival.delay.toInt() : 0;
-        final departureDelay = stu.hasDeparture() ? stu.departure.delay.toInt() : 0;
-        final delaySeconds = arrivalDelay != 0 ? arrivalDelay : departureDelay;
-
-        final stop = StopEta(
-          stopIdRaw: stopIdRaw,
-          stopIdCanon: stopCanon,
-          etaLocal: etaLocal,
-          delaySeconds: delaySeconds,
-        );
-
-        upcoming.add(stop);
-
-        if (_stopIdMatches(stopCanon, destCanon) && matchedDest == null) {
-          matchedDest = stop;
-          matchedStopIdRaw = stopIdRaw;
-        }
-      }
-
-      if (upcoming.isEmpty) continue;
-      upcoming.sort((a, b) => a.etaLocal.compareTo(b.etaLocal));
-      var usedBaselMainFallback = false;
-
-      if (requireDestinationMatch && matchedDest == null && MatchingService.isBaselMainStationQuery(destCanon)) {
-        StopEta? baselMain;
-        for (final s in upcoming) {
-          if (_isBaselMainStationStopHintViaService(s)) {
-            baselMain = s;
-            break;
-          }
-        }
-        if (baselMain != null) {
-          matchedDest = baselMain;
-          matchedStopIdRaw = baselMain.stopIdRaw;
-          usedBaselMainFallback = true;
-          _trace(
-            'GTFS-RT destination fallback used=basel-main tripId="$tripId" routeId="$routeId" '
-            'destCanon="$destCanon" matchedStopId="${baselMain.stopIdRaw}" etaLocal=${baselMain.etaLocal.toIso8601String()}',
-          );
-        }
-      }
-
-      if (requireDestinationMatch && matchedDest == null) {
-        _trace(
-          'GTFS-RT reject reason=destination_not_found tripId="$tripId" routeId="$routeId" '
-          'startDate="${trip.startDate}" startTime="${trip.startTime}" queryNorm="$tq" '
-          'displayNorm="$displayNorm" routeNorm="$routeNorm" tripNorm="$tripNorm" '
-          'tripShortNorm="$tripShortNorm" routeShortNorm="$routeShortNorm" '
-          'destCanon="$destCanon" destinationFound=false upcomingStops=${upcoming.length}',
-        );
-        continue;
-      }
-
-      final selected = matchedDest ?? upcoming.first;
-      final terminal = upcoming.last;
-
-      final candidate = TripCandidate(
-          tripId: tripId,
-          routeId: routeId,
-          startDate: trip.startDate,
-          startTime: trip.startTime,
-          stopId: matchedStopIdRaw ?? selected.stopIdRaw,
-          etaLocal: selected.etaLocal,
-          delaySeconds: selected.delaySeconds,
-          displayTrain: displayTrain,
-          vehicleLabel: MatchingService.vehicleLabelFromDisplay(displayTrain),
-          destinationMatched: matchedDest != null,
-          upcomingStops: upcoming.take(40).toList(),
-          terminalStopId: terminal.stopIdRaw,
-          terminalStopIdCanon: terminal.stopIdCanon,
-        );
-      out.add(candidate);
-      _trace(
-        'GTFS-RT candidate found tripId=${candidate.tripId} routeId=${candidate.routeId} '
-        'stopId=${candidate.stopId} etaLocal=${candidate.etaLocal.toIso8601String()} '
-        'delaySeconds=${candidate.delaySeconds} terminal="${_terminalLabel(candidate)}" '
-        'baselMainFallbackUsed=$usedBaselMainFallback',
-      );
-    }
-
-    out.sort((a, b) => a.etaLocal.compareTo(b.etaLocal));
-    return out.take(15).toList();
+    return _transportService.findCandidates(
+      feed,
+      trainQuery,
+      destQuery,
+      requireDestinationMatch: requireDestinationMatch,
+    );
   }
 
 Future<StopEta?> _pickStopBottomSheet({
