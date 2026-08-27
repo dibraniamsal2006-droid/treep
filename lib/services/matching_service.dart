@@ -6,8 +6,70 @@ typedef TraceLogger = void Function(String message);
 typedef DirectionKeyResolver = String Function(TripCandidate candidate);
 typedef TerminalLabelResolver = String Function(TripCandidate candidate);
 
+enum _TrainIdentityKind {
+  empty,
+  lettersOnly,
+  digitsOnly,
+  lettersAndDigits,
+  mixed,
+}
+
+class _PublicTrainIdentity {
+  const _PublicTrainIdentity({
+    required this.normalizedRaw,
+    required this.letters,
+    required this.digits,
+    required this.kind,
+  });
+
+  factory _PublicTrainIdentity.parse(String raw) {
+    final normalizedRaw = MatchingService.normalizeTrainToken(raw);
+    final letters = normalizedRaw.replaceAll(RegExp(r'\d+'), '');
+    final digits = normalizedRaw.replaceAll(RegExp(r'\D+'), '');
+
+    final _TrainIdentityKind kind;
+    if (normalizedRaw.isEmpty) {
+      kind = _TrainIdentityKind.empty;
+    } else if (letters.isNotEmpty &&
+        digits.isEmpty &&
+        letters == normalizedRaw) {
+      kind = _TrainIdentityKind.lettersOnly;
+    } else if (letters.isEmpty &&
+        digits.isNotEmpty &&
+        digits == normalizedRaw) {
+      kind = _TrainIdentityKind.digitsOnly;
+    } else if (letters.isNotEmpty &&
+        digits.isNotEmpty &&
+        normalizedRaw == '$letters$digits') {
+      kind = _TrainIdentityKind.lettersAndDigits;
+    } else {
+      kind = _TrainIdentityKind.mixed;
+    }
+
+    return _PublicTrainIdentity(
+      normalizedRaw: normalizedRaw,
+      letters: letters,
+      digits: digits,
+      kind: kind,
+    );
+  }
+
+  final String normalizedRaw;
+  final String letters;
+  final String digits;
+  final _TrainIdentityKind kind;
+
+  bool get isEmpty => kind == _TrainIdentityKind.empty;
+  bool get isLettersOnly => kind == _TrainIdentityKind.lettersOnly;
+  bool get isDigitsOnly => kind == _TrainIdentityKind.digitsOnly;
+  bool get isLettersAndDigits => kind == _TrainIdentityKind.lettersAndDigits;
+}
+
 class MatchingService {
-  static bool looksInternalStopToken(String value, {required StopIdNormalizer normalizeStopId}) {
+  static bool looksInternalStopToken(
+    String value, {
+    required StopIdNormalizer normalizeStopId,
+  }) {
     final raw = value.trim();
     if (raw.isEmpty) return false;
     if (RegExp(r'^\d+$').hasMatch(raw)) return true;
@@ -26,10 +88,9 @@ class MatchingService {
     // transport.opendata.ch station ids are commonly 7 digits (e.g. 8503000).
     // Some APIs also accept 9 digits with leading zeros, but padding can *break* matching
     // for certain stations. So: keep 7-digit IDs as-is; keep 9-digit IDs as-is; otherwise pad.
-    final digits = RegExp(r'\d+')
-        .allMatches(canonOrDigits)
-        .map((m) => m.group(0)!)
-        .join();
+    final digits = RegExp(
+      r'\d+',
+    ).allMatches(canonOrDigits).map((m) => m.group(0)!).join();
 
     if (digits.isEmpty) return canonOrDigits;
     if (digits.length == 7 || digits.length == 9) return digits;
@@ -105,74 +166,134 @@ class MatchingService {
   }
 
   static bool matchesTrainQuery(String tq, String candidateNorm) {
-    if (tq.isEmpty) return true;
-    if (candidateNorm.isEmpty) return false;
+    return _matchesTrainIdentity(
+      _PublicTrainIdentity.parse(tq),
+      _PublicTrainIdentity.parse(candidateNorm),
+      allowCollapsedAdditionalNumber: true,
+    );
+  }
 
-    if (candidateNorm == tq) return true;
+  static bool _matchesTrainIdentity(
+    _PublicTrainIdentity query,
+    _PublicTrainIdentity candidate, {
+    required bool allowCollapsedAdditionalNumber,
+  }) {
+    if (query.isEmpty) return true;
+    if (candidate.isEmpty) return false;
+
+    if (candidate.normalizedRaw == query.normalizedRaw) return true;
 
     // If the query contains both letters and digits (e.g. "s3", "ic5"),
     // require an exact (letters, digits) match. This avoids S3 matching S33.
-    final qLetters = tq.replaceAll(RegExp(r'\d+'), '');
-    final qDigits = tq.replaceAll(RegExp(r'\D+'), '');
-    if (qLetters.isNotEmpty && qDigits.isNotEmpty) {
-      final cLetters = candidateNorm.replaceAll(RegExp(r'\d+'), '');
-      final cDigits = candidateNorm.replaceAll(RegExp(r'\D+'), '');
-      return cLetters == qLetters && cDigits == qDigits;
+    if (query.isLettersAndDigits) {
+      if (candidate.isLettersAndDigits &&
+          candidate.letters == query.letters &&
+          candidate.digits == query.digits) {
+        return true;
+      }
+
+      // Some existing callers compact the raw label before matching, so
+      // "IR55 2317" arrives here as "ir552317". Recover only a leading exact
+      // 1-3 digit public identity followed by a four-digit train number. The
+      // split is derived independently of the query, so IR5 still cannot match
+      // IR55 2317. Short continuations stay strict, protecting S3/S33, S2/S20,
+      // and IC5/IC51.
+      if (allowCollapsedAdditionalNumber &&
+          candidate.isLettersAndDigits &&
+          candidate.letters == query.letters &&
+          candidate.digits.length >= 5 &&
+          candidate.digits.length <= 7) {
+        final publicDigits = candidate.digits.substring(
+          0,
+          candidate.digits.length - 4,
+        );
+        if (publicDigits == query.digits) return true;
+      }
+
+      return false;
     }
 
     // Digits-only query (e.g. "111") can match within a line id like "b111".
-    if (qLetters.isEmpty && qDigits.isNotEmpty) {
-      return candidateNorm.contains(qDigits);
+    if (query.isDigitsOnly) {
+      return candidate.normalizedRaw.contains(query.digits);
     }
 
     // Letters-only query (rare) -> prefix match.
-    if (qLetters.isNotEmpty && qDigits.isEmpty) {
-      return candidateNorm.startsWith(qLetters);
+    if (query.isLettersOnly) {
+      return candidate.normalizedRaw.startsWith(query.letters);
     }
 
-    return candidateNorm.contains(tq);
+    return candidate.normalizedRaw.contains(query.normalizedRaw);
   }
 
   static String? extractPublicLineId(String rawLabel) {
-    final raw = rawLabel.trim().toLowerCase();
+    final raw = rawLabel.trim();
     if (raw.isEmpty) return null;
 
     // Match forms like "IR55", "IR 55", "IC-5", "S 20".
-    final m = RegExp(r'\b([a-z]{1,4})\s*[-/]?\s*(\d{1,3})\b').firstMatch(raw);
+    final m = RegExp(
+      r'\b([a-z]{1,4})\s*[-/]?\s*(\d{1,3})\b',
+      caseSensitive: false,
+    ).firstMatch(raw);
     if (m != null) {
       final letters = m.group(1) ?? '';
       final digits = m.group(2) ?? '';
-      if (letters.isNotEmpty && digits.isNotEmpty) return '$letters$digits';
+      if (letters.isNotEmpty && digits.isNotEmpty) {
+        return _PublicTrainIdentity.parse('$letters$digits').normalizedRaw;
+      }
     }
 
-    final compact = RegExp(r'\b([a-z]{1,4}\d{1,3})\b').firstMatch(raw);
+    final compact = RegExp(
+      r'\b([a-z]{1,4}\d{1,3})\b',
+      caseSensitive: false,
+    ).firstMatch(raw);
     if (compact != null) {
-      return compact.group(1);
+      return _PublicTrainIdentity.parse(compact.group(1) ?? '').normalizedRaw;
     }
     return null;
   }
 
-  static bool matchesFallbackPublicLabel(String trainQuery, TripCandidate candidate) {
-    final queryNorm = normalizeTrainToken(trainQuery);
-    if (queryNorm.isEmpty) return true;
+  static bool matchesFallbackPublicLabel(
+    String trainQuery,
+    TripCandidate candidate,
+  ) {
+    final query = _PublicTrainIdentity.parse(trainQuery);
+    if (query.isEmpty) return true;
 
-    final qLetters = queryNorm.replaceAll(RegExp(r'\d+'), '');
-    final qDigits = queryNorm.replaceAll(RegExp(r'\D+'), '');
-
-    final displayNorm = normalizeTrainToken(candidate.displayTrain);
-    final routeNorm = normalizeTrainToken(candidate.routeId);
-    if (matchesTrainQuery(queryNorm, displayNorm) || matchesTrainQuery(queryNorm, routeNorm)) {
+    final display = _PublicTrainIdentity.parse(candidate.displayTrain);
+    final route = _PublicTrainIdentity.parse(candidate.routeId);
+    if (_matchesTrainIdentity(
+      query,
+      display,
+      allowCollapsedAdditionalNumber: true,
+    )) {
       return true;
     }
 
     final displayLineId = extractPublicLineId(candidate.displayTrain);
     final routeLineId = extractPublicLineId(candidate.routeId);
-    if (displayLineId != null && displayLineId == queryNorm) return true;
-    if (routeLineId != null && routeLineId == queryNorm) return true;
+    if (displayLineId != null && displayLineId == query.normalizedRaw) {
+      return true;
+    }
+    if (routeLineId != null && routeLineId == query.normalizedRaw) return true;
+
+    // A route id may be a technical GTFS identifier. Preserve exact/category
+    // matching, but do not infer a public line plus train number from a
+    // delimiter-free route id as we do for the public display label.
+    if (_matchesTrainIdentity(
+      query,
+      route,
+      allowCollapsedAdditionalNumber: false,
+    )) {
+      return true;
+    }
 
     // For letters-only queries (EC/IC/IR), keep relaxed prefix behavior.
-    if (qLetters.isNotEmpty && qDigits.isEmpty) {
-      if (displayNorm.startsWith(qLetters) || routeNorm.startsWith(qLetters)) return true;
+    if (query.isLettersOnly) {
+      if (display.normalizedRaw.startsWith(query.letters) ||
+          route.normalizedRaw.startsWith(query.letters)) {
+        return true;
+      }
     }
 
     return false;
@@ -185,46 +306,57 @@ class MatchingService {
     for (final p in parts) {
       final t = p.trim();
       if (t.isEmpty) continue;
-      if (!RegExp(r'[a-z]').hasMatch(t)) continue;
+      if (_PublicTrainIdentity.parse(t).letters.isEmpty) continue;
       out.add(t);
     }
     return out;
   }
 
-  static bool matchesTrainQueryTokenAware(String trainQuery, List<String> rawLabels) {
-    final tq = normalizeTrainToken(trainQuery);
-    if (tq.isEmpty) return true;
-
-    final qLetters = tq.replaceAll(RegExp(r'\d+'), '');
-    final qDigits = tq.replaceAll(RegExp(r'\D+'), '');
+  static bool matchesTrainQueryTokenAware(
+    String trainQuery,
+    List<String> rawLabels,
+  ) {
+    final query = _PublicTrainIdentity.parse(trainQuery);
+    if (query.isEmpty) return true;
 
     for (final raw in rawLabels) {
-      final norm = normalizeTrainToken(raw);
-      if (matchesTrainQuery(tq, norm)) return true;
+      final candidate = _PublicTrainIdentity.parse(raw);
+      if (_matchesTrainIdentity(
+        query,
+        candidate,
+        allowCollapsedAdditionalNumber: true,
+      )) {
+        return true;
+      }
+
+      final publicLineId = extractPublicLineId(raw);
+      if (publicLineId != null && publicLineId == query.normalizedRaw) {
+        return true;
+      }
 
       final tokens = trainLabelTokens(raw);
       for (final token in tokens) {
-        final tokenNorm = normalizeTrainToken(token);
-        if (tokenNorm.isEmpty) continue;
-
-        final tLetters = tokenNorm.replaceAll(RegExp(r'\d+'), '');
-        final tDigits = tokenNorm.replaceAll(RegExp(r'\D+'), '');
+        final tokenIdentity = _PublicTrainIdentity.parse(token);
+        if (tokenIdentity.isEmpty) continue;
 
         // letters+digits query: strict exact letters+digits (protects S3 vs S33)
-        if (qLetters.isNotEmpty && qDigits.isNotEmpty) {
-          if (tLetters == qLetters && tDigits == qDigits) return true;
+        if (query.isLettersAndDigits) {
+          if (tokenIdentity.letters == query.letters &&
+              tokenIdentity.digits == query.digits) {
+            return true;
+          }
           continue;
         }
 
         // letters-only query: tolerant prefix on token ("EC" matches "EC7", "ECE")
-        if (qLetters.isNotEmpty && qDigits.isEmpty) {
-          if (tLetters.startsWith(qLetters)) return true;
+        if (query.isLettersOnly) {
+          if (tokenIdentity.letters.startsWith(query.letters)) return true;
           continue;
         }
 
         // digits-only query: keep broad matching behavior
-        if (qLetters.isEmpty && qDigits.isNotEmpty) {
-          if (tokenNorm.contains(qDigits)) return true;
+        if (query.isDigitsOnly) {
+          if (tokenIdentity.normalizedRaw.contains(query.digits)) return true;
         }
       }
     }
@@ -244,11 +376,15 @@ class MatchingService {
     final stopCanon = normalizeStopId(stop.stopIdCanon) ?? stop.stopIdCanon;
     if (stopCanon == '8500010') return true;
 
-    final rawDigits = RegExp(r'\d+').allMatches(stop.stopIdRaw).map((m) => m.group(0)!).join();
+    final rawDigits = RegExp(
+      r'\d+',
+    ).allMatches(stop.stopIdRaw).map((m) => m.group(0)!).join();
     if (rawDigits.contains('8500010')) return true;
 
     final name = (stopNameCache[stopCanon] ?? '').toLowerCase();
-    if (name.contains('basel') && name.contains('sbb') && !name.contains('bad')) {
+    if (name.contains('basel') &&
+        name.contains('sbb') &&
+        !name.contains('bad')) {
       return true;
     }
 
@@ -256,24 +392,19 @@ class MatchingService {
   }
 
   static bool isLettersOnlyLongDistanceQuery(String trainQuery) {
-    final tq = normalizeTrainToken(trainQuery);
-    if (tq.isEmpty) return false;
-    final letters = tq.replaceAll(RegExp(r'\d+'), '');
-    final digits = tq.replaceAll(RegExp(r'\D+'), '');
-    if (letters.isEmpty || digits.isNotEmpty) return false;
-    return letters == 'ec' || letters == 'ic' || letters == 'ir';
+    final query = _PublicTrainIdentity.parse(trainQuery);
+    if (!query.isLettersOnly) return false;
+    return query.letters == 'ec' ||
+        query.letters == 'ic' ||
+        query.letters == 'ir';
   }
 
   static bool shouldUseGtfsBridgeForQuery(String trainQuery) {
-    final tq = normalizeTrainToken(trainQuery);
-    if (tq.isEmpty) return false;
-
-    final letters = tq.replaceAll(RegExp(r'\d+'), '');
-    final digits = tq.replaceAll(RegExp(r'\D+'), '');
-    if (letters.isEmpty) return false;
+    final query = _PublicTrainIdentity.parse(trainQuery);
+    if (query.isEmpty || query.letters.isEmpty) return false;
 
     // Existing long-distance letters-only queries (EC/IC/IR).
-    if (digits.isEmpty) {
+    if (query.isLettersOnly) {
       return isLettersOnlyLongDistanceQuery(trainQuery);
     }
 
@@ -282,20 +413,19 @@ class MatchingService {
   }
 
   static String gtfsBridgeDecisionReason(String trainQuery) {
-    final tq = normalizeTrainToken(trainQuery);
-    if (tq.isEmpty) return 'empty-query';
-
-    final letters = tq.replaceAll(RegExp(r'\d+'), '');
-    final digits = tq.replaceAll(RegExp(r'\D+'), '');
-    if (letters.isEmpty) return 'digits-only-query';
+    final query = _PublicTrainIdentity.parse(trainQuery);
+    if (query.isEmpty) return 'empty-query';
+    if (query.letters.isEmpty) return 'digits-only-query';
 
     // Disable bridge for S-lines (S3, S20, SN1, ...).
-    if (RegExp(r'^sn?\d+$').hasMatch(tq)) {
+    if (RegExp(r'^sn?\d+$').hasMatch(query.normalizedRaw)) {
       return 'local-s-line';
     }
 
-    if (digits.isEmpty) {
-      return isLettersOnlyLongDistanceQuery(trainQuery) ? 'long-distance-letters' : 'letters-only-not-supported';
+    if (query.isLettersOnly) {
+      return isLettersOnlyLongDistanceQuery(trainQuery)
+          ? 'long-distance-letters'
+          : 'letters-only-not-supported';
     }
 
     return 'letters+digits-supported';
@@ -383,7 +513,8 @@ class MatchingService {
       }
     }
 
-    final out = seen.values.toList()..sort((a, b) => a.etaLocal.compareTo(b.etaLocal));
+    final out = seen.values.toList()
+      ..sort((a, b) => a.etaLocal.compareTo(b.etaLocal));
     trace('Dedupe after count=${out.length}');
     return out;
   }

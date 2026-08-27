@@ -19,13 +19,246 @@ import 'settings_screen.dart';
 
 enum _PullUpFooterState { idle, loading, exhausted }
 
+class LocalDirectionEnrichmentDecision {
+  const LocalDirectionEnrichmentDecision({
+    required this.original,
+    required this.result,
+    required this.counterpart,
+    required this.etaDifferenceSeconds,
+    required this.reason,
+  });
+
+  final TripCandidate original;
+  final TripCandidate result;
+  final TripCandidate? counterpart;
+  final int? etaDifferenceSeconds;
+  final String reason;
+
+  bool get enriched => reason == 'enriched';
+}
+
+class LocalDirectionEnrichmentResult {
+  const LocalDirectionEnrichmentResult({
+    required this.candidates,
+    required this.decisions,
+  });
+
+  final List<TripCandidate> candidates;
+  final List<LocalDirectionEnrichmentDecision> decisions;
+
+  int get enrichedCount =>
+      decisions.where((decision) => decision.enriched).length;
+}
+
+LocalDirectionEnrichmentResult enrichLocalLineDirections({
+  required List<TripCandidate> gtfsCandidates,
+  required List<TripCandidate> stationboardCandidates,
+  required String trainQuery,
+  required bool Function(String a, String b) stopIdsMatch,
+  required String Function(TripCandidate candidate) directionLabel,
+  Duration maxEtaDifference = const Duration(minutes: 4),
+  Duration ambiguityMargin = const Duration(seconds: 90),
+}) {
+  final queryNorm = MatchingService.normalizeTrainToken(trainQuery);
+
+  bool matchesRequestedLine(TripCandidate candidate) {
+    final displayNorm = MatchingService.normalizeTrainToken(
+      candidate.displayTrain,
+    );
+    final routeNorm = MatchingService.normalizeTrainToken(candidate.routeId);
+    return MatchingService.matchesTrainQuery(queryNorm, displayNorm) ||
+        MatchingService.matchesTrainQuery(queryNorm, routeNorm);
+  }
+
+  String publicDirectionToken(TripCandidate candidate) {
+    final withoutStopId = directionLabel(
+      candidate,
+    ).replaceFirst(RegExp(r'\s*\(\d+\)\s*$'), '');
+    return MatchingService.normalizeStationToken(withoutStopId);
+  }
+
+  final output = <TripCandidate>[];
+  final decisions = <LocalDirectionEnrichmentDecision>[];
+
+  for (var gtfsIndex = 0; gtfsIndex < gtfsCandidates.length; gtfsIndex++) {
+    final gtfs = gtfsCandidates[gtfsIndex];
+    final eligible = <({int index, TripCandidate candidate, int etaDiff})>[];
+
+    for (
+      var fallbackIndex = 0;
+      fallbackIndex < stationboardCandidates.length;
+      fallbackIndex++
+    ) {
+      final fallback = stationboardCandidates[fallbackIndex];
+      if (!matchesRequestedLine(gtfs) || !matchesRequestedLine(fallback)) {
+        continue;
+      }
+      if (!gtfs.destinationMatched || !fallback.destinationMatched) continue;
+      if (!stopIdsMatch(gtfs.stopId, fallback.stopId)) continue;
+
+      eligible.add((
+        index: fallbackIndex,
+        candidate: fallback,
+        etaDiff: gtfs.etaLocal.difference(fallback.etaLocal).inSeconds.abs(),
+      ));
+    }
+
+    eligible.sort((a, b) => a.etaDiff.compareTo(b.etaDiff));
+    if (eligible.isEmpty) {
+      output.add(gtfs);
+      decisions.add(
+        LocalDirectionEnrichmentDecision(
+          original: gtfs,
+          result: gtfs,
+          counterpart: null,
+          etaDifferenceSeconds: null,
+          reason: 'no-same-line-destination-counterpart',
+        ),
+      );
+      continue;
+    }
+
+    final best = eligible.first;
+    if (best.etaDiff > maxEtaDifference.inSeconds) {
+      output.add(gtfs);
+      decisions.add(
+        LocalDirectionEnrichmentDecision(
+          original: gtfs,
+          result: gtfs,
+          counterpart: best.candidate,
+          etaDifferenceSeconds: best.etaDiff,
+          reason: 'outside-time-window',
+        ),
+      );
+      continue;
+    }
+    if (eligible.length > 1 &&
+        eligible[1].etaDiff - best.etaDiff < ambiguityMargin.inSeconds) {
+      output.add(gtfs);
+      decisions.add(
+        LocalDirectionEnrichmentDecision(
+          original: gtfs,
+          result: gtfs,
+          counterpart: best.candidate,
+          etaDifferenceSeconds: best.etaDiff,
+          reason: 'ambiguous-stationboard-counterpart',
+        ),
+      );
+      continue;
+    }
+
+    final reciprocalGtfs = <({int index, int etaDiff})>[];
+    for (var otherIndex = 0; otherIndex < gtfsCandidates.length; otherIndex++) {
+      final other = gtfsCandidates[otherIndex];
+      if (!matchesRequestedLine(other) || !other.destinationMatched) continue;
+      if (!stopIdsMatch(other.stopId, best.candidate.stopId)) continue;
+      reciprocalGtfs.add((
+        index: otherIndex,
+        etaDiff: other.etaLocal
+            .difference(best.candidate.etaLocal)
+            .inSeconds
+            .abs(),
+      ));
+    }
+    reciprocalGtfs.sort((a, b) => a.etaDiff.compareTo(b.etaDiff));
+    final reciprocalIsClear =
+        reciprocalGtfs.isNotEmpty &&
+        reciprocalGtfs.first.index == gtfsIndex &&
+        (reciprocalGtfs.length == 1 ||
+            reciprocalGtfs[1].etaDiff - reciprocalGtfs.first.etaDiff >=
+                ambiguityMargin.inSeconds);
+    if (!reciprocalIsClear) {
+      output.add(gtfs);
+      decisions.add(
+        LocalDirectionEnrichmentDecision(
+          original: gtfs,
+          result: gtfs,
+          counterpart: best.candidate,
+          etaDifferenceSeconds: best.etaDiff,
+          reason: 'ambiguous-gtfs-counterpart',
+        ),
+      );
+      continue;
+    }
+
+    final fallbackDirection = publicDirectionToken(best.candidate);
+    if (fallbackDirection.isEmpty || fallbackDirection == 'unknown') {
+      output.add(gtfs);
+      decisions.add(
+        LocalDirectionEnrichmentDecision(
+          original: gtfs,
+          result: gtfs,
+          counterpart: best.candidate,
+          etaDifferenceSeconds: best.etaDiff,
+          reason: 'counterpart-direction-unusable',
+        ),
+      );
+      continue;
+    }
+
+    if (publicDirectionToken(gtfs) == fallbackDirection) {
+      output.add(gtfs);
+      decisions.add(
+        LocalDirectionEnrichmentDecision(
+          original: gtfs,
+          result: gtfs,
+          counterpart: best.candidate,
+          etaDifferenceSeconds: best.etaDiff,
+          reason: 'direction-already-correct',
+        ),
+      );
+      continue;
+    }
+
+    final fallbackTerminalRaw = best.candidate.terminalStopId.trim();
+    final enriched = TripCandidate(
+      tripId: gtfs.tripId,
+      routeId: gtfs.routeId,
+      startDate: gtfs.startDate,
+      startTime: gtfs.startTime,
+      stopId: gtfs.stopId,
+      etaLocal: gtfs.etaLocal,
+      delaySeconds: gtfs.delaySeconds,
+      displayTrain: gtfs.displayTrain,
+      vehicleLabel: gtfs.vehicleLabel,
+      destinationMatched: gtfs.destinationMatched,
+      upcomingStops: gtfs.upcomingStops,
+      terminalStopId: fallbackTerminalRaw.isNotEmpty
+          ? fallbackTerminalRaw
+          : directionLabel(best.candidate),
+      terminalStopIdCanon: best.candidate.terminalStopIdCanon,
+    );
+    output.add(enriched);
+    decisions.add(
+      LocalDirectionEnrichmentDecision(
+        original: gtfs,
+        result: enriched,
+        counterpart: best.candidate,
+        etaDifferenceSeconds: best.etaDiff,
+        reason: 'enriched',
+      ),
+    );
+  }
+
+  return LocalDirectionEnrichmentResult(
+    candidates: output,
+    decisions: decisions,
+  );
+}
+
+bool candidateNeedsDestinationConfirmation(TripCandidate candidate) {
+  return !candidate.destinationMatched;
+}
+
 class TreepHome extends StatefulWidget {
   const TreepHome({
     super.key,
     this.onPreferencesChanged,
+    this.transportService,
   });
 
   final Future<void> Function()? onPreferencesChanged;
+  final TransportService? transportService;
 
   @override
   State<TreepHome> createState() => _TreepHomeState();
@@ -68,11 +301,13 @@ class _TreepHomeState extends State<TreepHome> {
   @override
   void initState() {
     super.initState();
-    _transportService = TransportService(
-      trace: _trace,
-      traceCandidates: _traceStageCandidates,
-      upcomingWindowHoursProvider: () => _upcomingWindowHours,
-    );
+    _transportService =
+        widget.transportService ??
+        TransportService(
+          trace: _trace,
+          traceCandidates: _traceStageCandidates,
+          upcomingWindowHoursProvider: () => _upcomingWindowHours,
+        );
     _loadPrefs();
   }
 
@@ -84,7 +319,9 @@ class _TreepHomeState extends State<TreepHome> {
       final rawLimit = prefs.getInt(kPrefsUpcomingTripsLimitKey) ?? 8;
       final limit = rawLimit.clamp(1, 20);
       final rawWindowHours = prefs.getInt(kPrefsUpcomingWindowHoursKey) ?? 2;
-      final windowHours = <int>{2, 4, 6}.contains(rawWindowHours) ? rawWindowHours : 2;
+      final windowHours = <int>{2, 4, 6}.contains(rawWindowHours)
+          ? rawWindowHours
+          : 2;
 
       if (!mounted) return;
       setState(() {
@@ -96,9 +333,9 @@ class _TreepHomeState extends State<TreepHome> {
   }
 
   Future<void> _openSettings() async {
-    await Navigator.of(context).push(
-      MaterialPageRoute(builder: (_) => const SettingsScreen()),
-    );
+    await Navigator.of(
+      context,
+    ).push(MaterialPageRoute(builder: (_) => const SettingsScreen()));
     await _loadPrefs();
     await widget.onPreferencesChanged?.call();
   }
@@ -125,6 +362,7 @@ class _TreepHomeState extends State<TreepHome> {
     if (!_sleepLinesEnabled) return '';
     return _sleepLines[_rng.nextInt(_sleepLines.length)];
   }
+
   Future<void> _showSleepLineOverlay(String line) async {
     if (!_sleepLinesEnabled) return;
     final text = line.trim();
@@ -163,7 +401,10 @@ class _TreepHomeState extends State<TreepHome> {
               color: Colors.transparent,
               child: Container(
                 margin: const EdgeInsets.symmetric(horizontal: 22),
-                padding: const EdgeInsets.symmetric(horizontal: 18, vertical: 16),
+                padding: const EdgeInsets.symmetric(
+                  horizontal: 18,
+                  vertical: 16,
+                ),
                 decoration: BoxDecoration(
                   color: Theme.of(ctx).colorScheme.surface,
                   borderRadius: BorderRadius.circular(16),
@@ -198,7 +439,10 @@ class _TreepHomeState extends State<TreepHome> {
         );
       },
       transitionBuilder: (ctx, anim, sec, child) {
-        final curved = CurvedAnimation(parent: anim, curve: Curves.easeOutCubic);
+        final curved = CurvedAnimation(
+          parent: anim,
+          curve: Curves.easeOutCubic,
+        );
         return FadeTransition(
           opacity: curved,
           child: ScaleTransition(
@@ -213,11 +457,13 @@ class _TreepHomeState extends State<TreepHome> {
       _sleepOverlayShowing = false;
     });
   }
+
   String _hhmm(DateTime dt) {
     final h = dt.hour.toString().padLeft(2, '0');
     final m = dt.minute.toString().padLeft(2, '0');
     return '$h:$m';
   }
+
   // === TREEP: ALARM LOGIC START ===
   Future<void> _stopAlarm() async {
     _stopForegroundRing();
@@ -235,6 +481,7 @@ class _TreepHomeState extends State<TreepHome> {
       _nativeAlarmArmed = false;
     });
   }
+
   void _startForegroundRing(DateTime firstFire) {
     _foregroundArmTimer?.cancel();
     _ringTimer?.cancel();
@@ -274,7 +521,9 @@ class _TreepHomeState extends State<TreepHome> {
         barrierDismissible: false,
         builder: (_) => AlertDialog(
           title: const Text('⏰ TREEP ALARM'),
-          content: const Text('You are approaching your stop.\n\nPress STOP to silence the alarm.'),
+          content: const Text(
+            'You are approaching your stop.\n\nPress STOP to silence the alarm.',
+          ),
           actions: [
             TextButton(
               onPressed: () {
@@ -283,7 +532,10 @@ class _TreepHomeState extends State<TreepHome> {
               },
               child: const Text(
                 'STOP ALARM',
-                style: TextStyle(color: Colors.red, fontWeight: FontWeight.bold),
+                style: TextStyle(
+                  color: Colors.red,
+                  fontWeight: FontWeight.bold,
+                ),
               ),
             ),
           ],
@@ -306,6 +558,7 @@ class _TreepHomeState extends State<TreepHome> {
     if (mounted && _isRinging) setState(() => _isRinging = false);
     if (mounted && _isSelfTesting) setState(() => _isSelfTesting = false);
   }
+
   void _startLiveUpdates() {
     _liveUpdateTimer?.cancel();
     _liveUpdateTimer = Timer.periodic(const Duration(seconds: 25), (_) {
@@ -324,10 +577,21 @@ class _TreepHomeState extends State<TreepHome> {
       final updated = await _refreshCandidateEta(current);
       if (!mounted) return;
       if (updated == null) return;
-      _traceCandidate('Live-update current', current, source: 'tick-before-compare');
-      _traceCandidate('Live-update fetched', updated, source: 'tick-before-compare');
+      _traceCandidate(
+        'Live-update current',
+        current,
+        source: 'tick-before-compare',
+      );
+      _traceCandidate(
+        'Live-update fetched',
+        updated,
+        source: 'tick-before-compare',
+      );
 
-      final etaDiff = updated.etaLocal.difference(current.etaLocal).inSeconds.abs();
+      final etaDiff = updated.etaLocal
+          .difference(current.etaLocal)
+          .inSeconds
+          .abs();
       final delayDiff = (updated.delaySeconds - current.delaySeconds).abs();
       if (etaDiff < 30 && delayDiff < 30) return;
 
@@ -339,12 +603,19 @@ class _TreepHomeState extends State<TreepHome> {
     _traceCandidate('Live-update start', c, source: 'refresh-input');
     final refreshed = await _transportService.refreshCandidateEta(c);
     if (refreshed != null) {
-      _traceCandidate('Live-update service result', refreshed, source: 'refresh-service');
+      _traceCandidate(
+        'Live-update service result',
+        refreshed,
+        source: 'refresh-service',
+      );
     }
     return refreshed;
   }
 
-  Future<void> _rescheduleAlarmWith(TripCandidate updated, {required String reason}) async {
+  Future<void> _rescheduleAlarmWith(
+    TripCandidate updated, {
+    required String reason,
+  }) async {
     if (!mounted) return;
 
     _isRescheduling = true;
@@ -355,7 +626,11 @@ class _TreepHomeState extends State<TreepHome> {
       _trackingStatus =
           'Update: $reason — ETA ${_hhmm(updated.etaLocal)} (${_fmtDelay(updated.delaySeconds)})';
     });
-    _traceCandidate('selectedCandidate reassigned', updated, source: 'live-update');
+    _traceCandidate(
+      'selectedCandidate reassigned',
+      updated,
+      source: 'live-update',
+    );
 
     try {
       await _armAlarmFor(updated, showUx: false);
@@ -363,11 +638,14 @@ class _TreepHomeState extends State<TreepHome> {
       if (token == _rescheduleToken) {
         _isRescheduling = false;
         if (mounted) {
-          setState(() {}); // sorgt dafür, dass "Alarm: armed for ..." sicher neu rendert
+          setState(
+            () {},
+          ); // sorgt dafür, dass "Alarm: armed for ..." sicher neu rendert
         }
       }
     }
   }
+
   Future<void> _armAlarmFor(TripCandidate chosen, {bool showUx = true}) async {
     await _stopAlarm();
     await NotificationService.requestPermissions();
@@ -396,7 +674,10 @@ class _TreepHomeState extends State<TreepHome> {
     // UX (dialog + snackbar + sleep-line overlay) should only appear on explicit user action
     // and not more often than once every 30 seconds.
     final nowForUx = DateTime.now();
-    final allowUx = showUx && (_lastAlarmUxAt == null || nowForUx.difference(_lastAlarmUxAt!) > const Duration(seconds: 30));
+    final allowUx =
+        showUx &&
+        (_lastAlarmUxAt == null ||
+            nowForUx.difference(_lastAlarmUxAt!) > const Duration(seconds: 30));
 
     // Show an explicit OK dialog (user can disable it via “Nicht mehr anzeigen”).
     // Only when the user explicitly sets the alarm (not when we silently re-schedule).
@@ -496,7 +777,9 @@ class _TreepHomeState extends State<TreepHome> {
 
     int tick = 0;
     _selfTestHapticTimer?.cancel();
-    _selfTestHapticTimer = Timer.periodic(const Duration(milliseconds: 350), (_) {
+    _selfTestHapticTimer = Timer.periodic(const Duration(milliseconds: 350), (
+      _,
+    ) {
       // A slightly "aggressive" pattern (heavy-heavy-light) without being too spammy.
       tick++;
       try {
@@ -549,7 +832,8 @@ class _TreepHomeState extends State<TreepHome> {
                     CheckboxListTile(
                       contentPadding: EdgeInsets.zero,
                       value: dontShowAgain,
-                      onChanged: (v) => setLocalState(() => dontShowAgain = v ?? false),
+                      onChanged: (v) =>
+                          setLocalState(() => dontShowAgain = v ?? false),
                       title: const Text('Nicht mehr anzeigen'),
                     ),
                   ],
@@ -575,7 +859,6 @@ class _TreepHomeState extends State<TreepHome> {
     }
   }
 
-
   // === TREEP: ALARM LOGIC END ===
   String _fmtDelay(int delaySeconds) {
     final mins = (delaySeconds / 60).round();
@@ -598,7 +881,11 @@ class _TreepHomeState extends State<TreepHome> {
     );
   }
 
-  void _traceCandidatePool(String stage, List<TripCandidate> candidates, {String? source}) {
+  void _traceCandidatePool(
+    String stage,
+    List<TripCandidate> candidates, {
+    String? source,
+  }) {
     final src = source == null || source.isEmpty ? '' : ' source=$source';
     _trace('$stage$src count=${candidates.length}');
     final maxItems = candidates.length > 20 ? 20 : candidates.length;
@@ -610,25 +897,39 @@ class _TreepHomeState extends State<TreepHome> {
     }
   }
 
-  void _traceDirectionBuckets(String stage, Map<String, List<TripCandidate>> byDir) {
+  void _traceDirectionBuckets(
+    String stage,
+    Map<String, List<TripCandidate>> byDir,
+  ) {
     _trace('$stage bucketCount=${byDir.length}');
+    const maxItemsPerDirection = 6;
     final keys = byDir.keys.toList()..sort();
     for (final key in keys) {
       final list = [...(byDir[key] ?? const <TripCandidate>[])]
         ..sort((a, b) => a.etaLocal.compareTo(b.etaLocal));
       _trace('$stage bucket="$key" count=${list.length}');
-      for (final c in list) {
+      for (final c in list.take(maxItemsPerDirection)) {
         _trace(
           '$stage item bucket="$key" eta=${c.etaLocal.toIso8601String()} '
           'displayTrain="${c.displayTrain}" terminal="${_terminalLabel(c)}" tripId=${c.tripId}',
         );
       }
+      if (list.length > maxItemsPerDirection) {
+        _trace(
+          '$stage bucket="$key" truncated=${list.length - maxItemsPerDirection}',
+        );
+      }
     }
   }
 
-  void _traceStageCandidates(String stage, List<TripCandidate> candidates, {int max = 6}) {
+  void _traceStageCandidates(
+    String stage,
+    List<TripCandidate> candidates, {
+    int max = 6,
+  }) {
     _trace('$stage count=${candidates.length}');
-    final sorted = [...candidates]..sort((a, b) => a.etaLocal.compareTo(b.etaLocal));
+    final sorted = [...candidates]
+      ..sort((a, b) => a.etaLocal.compareTo(b.etaLocal));
     for (final c in sorted.take(max)) {
       _trace(
         '$stage item displayTrain="${c.displayTrain}" eta=${c.etaLocal.toIso8601String()} '
@@ -638,7 +939,10 @@ class _TreepHomeState extends State<TreepHome> {
     }
   }
 
-  List<TripCandidate> _dropPastCandidates(List<TripCandidate> input, {required String stage}) {
+  List<TripCandidate> _dropPastCandidates(
+    List<TripCandidate> input, {
+    required String stage,
+  }) {
     final now = DateTime.now();
     final cutoff = now.subtract(const Duration(seconds: 60));
     final out = input.where((c) => !c.etaLocal.isBefore(cutoff)).toList()
@@ -654,20 +958,21 @@ class _TreepHomeState extends State<TreepHome> {
     List<TripCandidate> filtered,
     List<TripCandidate> fresh,
     List<TripCandidate> deduped,
-  }) _runTrainQueryFallbackPostPipeline({
+  })
+  _runTrainQueryFallbackPostPipeline({
     required String scenarioTag,
     required String trainQueryNorm,
     required List<TripCandidate> broadArrivalCandidates,
   }) {
-    final filtered = broadArrivalCandidates
-        .where((c) {
-          final candidateNorm = _normalizeTrainToken(c.displayTrain);
-          return MatchingService.matchesTrainQuery(trainQueryNorm, candidateNorm);
-        })
-        .toList()
-      ..sort((a, b) => a.etaLocal.compareTo(b.etaLocal));
+    final filtered = broadArrivalCandidates.where((c) {
+      final candidateNorm = _normalizeTrainToken(c.displayTrain);
+      return MatchingService.matchesTrainQuery(trainQueryNorm, candidateNorm);
+    }).toList()..sort((a, b) => a.etaLocal.compareTo(b.etaLocal));
     _trace('Train-specific fallback filtered count=${filtered.length}');
-    _traceStageCandidates('Fallback public-filter leave $scenarioTag', filtered);
+    _traceStageCandidates(
+      'Fallback public-filter leave $scenarioTag',
+      filtered,
+    );
 
     for (final c in filtered.take(10)) {
       _trace(
@@ -684,7 +989,8 @@ class _TreepHomeState extends State<TreepHome> {
     _trace('Train-specific fallback stale-filter count=${fresh.length}');
     _traceStageCandidates('Fallback stale-filter leave $scenarioTag', fresh);
 
-    final deduped = _dedupeCandidatesViaService(fresh)..sort((a, b) => a.etaLocal.compareTo(b.etaLocal));
+    final deduped = _dedupeCandidatesViaService(fresh)
+      ..sort((a, b) => a.etaLocal.compareTo(b.etaLocal));
     _trace('Train-specific fallback dedupe count=${deduped.length}');
     _traceStageCandidates('Fallback dedupe leave $scenarioTag', deduped);
 
@@ -693,6 +999,15 @@ class _TreepHomeState extends State<TreepHome> {
 
   int _pickerTakePerDirection() {
     return _upcomingTripsLimit < 3 ? 3 : _upcomingTripsLimit;
+  }
+
+  void _cancelTrackingSelection(String stage) {
+    _trace('Pipeline cancelled stage=$stage reason=picker-dismissed');
+    if (!mounted) return;
+    setState(() {
+      _selectedCandidate = null;
+      _trackingStatus = 'Selection cancelled. No tracking was started.';
+    });
   }
 
   bool _stopIdMatches(String stopCanon, String destCanon) {
@@ -704,7 +1019,11 @@ class _TreepHomeState extends State<TreepHome> {
     required FeedMessage feed,
     required String destStopCanon,
   }) {
-    _traceCandidate('GTFS bridge start', fallbackCandidate, source: 'fallback-seed');
+    _traceCandidate(
+      'GTFS bridge start',
+      fallbackCandidate,
+      source: 'fallback-seed',
+    );
 
     final gtfsPool = _findCandidates(
       feed,
@@ -720,22 +1039,31 @@ class _TreepHomeState extends State<TreepHome> {
       return null;
     }
 
-    final fallbackTermNorm = MatchingService.normalizeStationToken(_terminalLabel(fallbackCandidate));
-    final fallbackStopCanon = _normalizeStopId(fallbackCandidate.stopId) ?? fallbackCandidate.stopId;
+    final fallbackTermNorm = MatchingService.normalizeStationToken(
+      _terminalLabel(fallbackCandidate),
+    );
+    final fallbackStopCanon =
+        _normalizeStopId(fallbackCandidate.stopId) ?? fallbackCandidate.stopId;
 
     TripCandidate? best;
     double? bestScore;
     double? secondBestScore;
 
     for (final g in gtfsPool) {
-      final etaDiffSec = g.etaLocal.difference(fallbackCandidate.etaLocal).inSeconds.abs();
-      final gtfsTermNorm = MatchingService.normalizeStationToken(_terminalLabel(g));
+      final etaDiffSec = g.etaLocal
+          .difference(fallbackCandidate.etaLocal)
+          .inSeconds
+          .abs();
+      final gtfsTermNorm = MatchingService.normalizeStationToken(
+        _terminalLabel(g),
+      );
 
       double terminalPenalty = 0;
       if (fallbackTermNorm.isNotEmpty && gtfsTermNorm.isNotEmpty) {
         if (fallbackTermNorm == gtfsTermNorm) {
           terminalPenalty = 0;
-        } else if (gtfsTermNorm.contains(fallbackTermNorm) || fallbackTermNorm.contains(gtfsTermNorm)) {
+        } else if (gtfsTermNorm.contains(fallbackTermNorm) ||
+            fallbackTermNorm.contains(gtfsTermNorm)) {
           terminalPenalty = 90;
         } else {
           terminalPenalty = 300;
@@ -743,7 +1071,9 @@ class _TreepHomeState extends State<TreepHome> {
       }
 
       final gtfsStopCanon = _normalizeStopId(g.stopId) ?? g.stopId;
-      final sameDest = _stopIdMatches(gtfsStopCanon, fallbackStopCanon) || _stopIdMatches(gtfsStopCanon, destStopCanon);
+      final sameDest =
+          _stopIdMatches(gtfsStopCanon, fallbackStopCanon) ||
+          _stopIdMatches(gtfsStopCanon, destStopCanon);
 
       var score = etaDiffSec.toDouble() + terminalPenalty;
       if (sameDest) score -= 40;
@@ -772,8 +1102,11 @@ class _TreepHomeState extends State<TreepHome> {
       return null;
     }
 
-    final clearWinner = secondBestScore == null || (secondBestScore - bestScore) >= 90;
-    final plausibleTime = best.etaLocal.difference(fallbackCandidate.etaLocal).inSeconds.abs() <= 15 * 60;
+    final clearWinner =
+        secondBestScore == null || (secondBestScore - bestScore) >= 90;
+    final plausibleTime =
+        best.etaLocal.difference(fallbackCandidate.etaLocal).inSeconds.abs() <=
+        15 * 60;
     if (!clearWinner || !plausibleTime) {
       _trace(
         'GTFS bridge no-candidates reason=not_clear '
@@ -790,7 +1123,9 @@ class _TreepHomeState extends State<TreepHome> {
     final gtfsTerminalCanon = best.terminalStopIdCanon.trim();
 
     // Preserve user-facing fallback labels. Only use GTFS terminal when fallback has no usable terminal text.
-    var mergedTerminalRaw = fallbackTerminalRaw.isNotEmpty ? fallbackTerminalRaw : gtfsTerminalRaw;
+    var mergedTerminalRaw = fallbackTerminalRaw.isNotEmpty
+        ? fallbackTerminalRaw
+        : gtfsTerminalRaw;
     var mergedTerminalCanon = fallbackTerminalCanon;
     if (mergedTerminalRaw.isEmpty && mergedTerminalCanon.isEmpty) {
       mergedTerminalRaw = gtfsTerminalRaw;
@@ -810,7 +1145,8 @@ class _TreepHomeState extends State<TreepHome> {
       // Keep public-facing line labeling from fallback stationboard.
       displayTrain: fallbackCandidate.displayTrain,
       vehicleLabel: fallbackCandidate.vehicleLabel,
-      destinationMatched: best.destinationMatched || fallbackCandidate.destinationMatched,
+      destinationMatched:
+          best.destinationMatched || fallbackCandidate.destinationMatched,
       upcomingStops: best.upcomingStops,
       terminalStopId: mergedTerminalRaw,
       terminalStopIdCanon: mergedTerminalCanon,
@@ -837,13 +1173,20 @@ class _TreepHomeState extends State<TreepHome> {
     String trainQuery,
     String destName,
   ) async {
-    return _transportService.findCandidatesByTrainAndDestinationName(feed, trainQuery, destName);
+    return _transportService.findCandidatesByTrainAndDestinationName(
+      feed,
+      trainQuery,
+      destName,
+    );
   }
+
   Future<void> _ensureStopName(String canonStopId) async {
     await _transportService.ensureStopName(canonStopId);
   }
 
-  Future<void> _warmStopNamesForCandidates(List<TripCandidate> candidates) async {
+  Future<void> _warmStopNamesForCandidates(
+    List<TripCandidate> candidates,
+  ) async {
     final ids = <String>{};
 
     for (final c in candidates) {
@@ -914,12 +1257,16 @@ class _TreepHomeState extends State<TreepHome> {
             Icon(
               Icons.expand_more,
               size: 16,
-              color: Theme.of(context).colorScheme.primary.withValues(alpha: 0.85),
+              color: Theme.of(
+                context,
+              ).colorScheme.primary.withValues(alpha: 0.85),
             ),
             const SizedBox(width: 6),
             Text(
               idleText,
-              style: baseStyle?.copyWith(color: Theme.of(context).colorScheme.primary),
+              style: baseStyle?.copyWith(
+                color: Theme.of(context).colorScheme.primary,
+              ),
               textAlign: TextAlign.center,
             ),
           ],
@@ -943,7 +1290,11 @@ class _TreepHomeState extends State<TreepHome> {
         );
         break;
       case _PullUpFooterState.exhausted:
-        child = Text(exhaustedText, style: baseStyle, textAlign: TextAlign.center);
+        child = Text(
+          exhaustedText,
+          style: baseStyle,
+          textAlign: TextAlign.center,
+        );
         break;
     }
 
@@ -965,14 +1316,13 @@ class _TreepHomeState extends State<TreepHome> {
     if (onTap == null || state != _PullUpFooterState.idle) return footer;
     return Material(
       color: Colors.transparent,
-      child: InkWell(
-        onTap: onTap,
-        child: footer,
-      ),
+      child: InkWell(onTap: onTap, child: footer),
     );
   }
 
-  Future<String> _pickDirectionBottomSheet(List<TripCandidate> candidates) async {
+  Future<String?> _pickDirectionBottomSheet(
+    List<TripCandidate> candidates,
+  ) async {
     final Map<String, List<TripCandidate>> groups = {};
     for (final c in candidates) {
       final key = _directionKey(c);
@@ -980,7 +1330,9 @@ class _TreepHomeState extends State<TreepHome> {
     }
     _traceDirectionBuckets('Direction-grouping', groups);
     // Warm station names for digit direction keys (GTFS stop_ids) so we show names instead of raw codes.
-    final digitKeys = groups.keys.where((k) => RegExp(r'^\\d+$').hasMatch(k)).toSet();
+    final digitKeys = groups.keys
+        .where((k) => RegExp(r'^\\d+$').hasMatch(k))
+        .toSet();
     if (digitKeys.isNotEmpty) {
       await Future.wait(digitKeys.map(_ensureStopName));
       if (!mounted) return 'unknown';
@@ -989,18 +1341,18 @@ class _TreepHomeState extends State<TreepHome> {
     final options = groups.entries
         .where((e) => e.key != 'unknown' && e.key.isNotEmpty)
         .map((e) {
-          final list = [...e.value]..sort((a, b) => a.etaLocal.compareTo(b.etaLocal));
+          final list = [...e.value]
+            ..sort((a, b) => a.etaLocal.compareTo(b.etaLocal));
           final first = list.first;
-          return (
-            key: e.key,
-            label: _terminalLabel(first),
-            allItems: list,
-          );
+          return (key: e.key, label: _terminalLabel(first), allItems: list);
         })
         .toList();
 
     if (options.isEmpty) return 'unknown';
-    final initialWindowHours = _upcomingWindowHours.clamp(2, _maxPickerHorizonHours);
+    final initialWindowHours = _upcomingWindowHours.clamp(
+      2,
+      _maxPickerHorizonHours,
+    );
     final anchor = DateTime.now();
 
     final picked = await showModalBottomSheet<String>(
@@ -1008,11 +1360,17 @@ class _TreepHomeState extends State<TreepHome> {
       showDragHandle: true,
       builder: (ctx) {
         var loadedHours = initialWindowHours;
-        List<({String key, String label, DateTime nextEta, int visibleCount})> visibleDirectionsForHours(int hours) {
+        List<({String key, String label, DateTime nextEta, int visibleCount})>
+        visibleDirectionsForHours(int hours) {
           final end = anchor.add(Duration(hours: hours));
-          final out = <({String key, String label, DateTime nextEta, int visibleCount})>[];
+          final out =
+              <
+                ({String key, String label, DateTime nextEta, int visibleCount})
+              >[];
           for (final o in options) {
-            final vis = o.allItems.where((c) => !c.etaLocal.isAfter(end)).toList();
+            final vis = o.allItems
+                .where((c) => !c.etaLocal.isAfter(end))
+                .toList();
             if (vis.isEmpty) continue;
             vis.sort((a, b) => a.etaLocal.compareTo(b.etaLocal));
             out.add((
@@ -1054,10 +1412,18 @@ class _TreepHomeState extends State<TreepHome> {
 
               while (nextHours < _maxPickerHorizonHours) {
                 nextHours += initialWindowHours;
-                if (nextHours > _maxPickerHorizonHours) nextHours = _maxPickerHorizonHours;
+                if (nextHours > _maxPickerHorizonHours) {
+                  nextHours = _maxPickerHorizonHours;
+                }
                 nextVisible = visibleDirectionsForHours(nextHours);
-                final oldConn = oldVisible.fold<int>(0, (s, o) => s + o.visibleCount);
-                final newConn = nextVisible.fold<int>(0, (s, o) => s + o.visibleCount);
+                final oldConn = oldVisible.fold<int>(
+                  0,
+                  (s, o) => s + o.visibleCount,
+                );
+                final newConn = nextVisible.fold<int>(
+                  0,
+                  (s, o) => s + o.visibleCount,
+                );
                 if (newConn > oldConn) break;
                 if (nextHours >= _maxPickerHorizonHours) break;
               }
@@ -1083,8 +1449,9 @@ class _TreepHomeState extends State<TreepHome> {
                 ),
                 padding: const EdgeInsets.symmetric(vertical: 8),
                 itemCount: visibleOptions.length + 1,
-                separatorBuilder: (_, i) =>
-                    i >= visibleOptions.length - 1 ? const SizedBox.shrink() : const Divider(height: 1),
+                separatorBuilder: (_, i) => i >= visibleOptions.length - 1
+                    ? const SizedBox.shrink()
+                    : const Divider(height: 1),
                 itemBuilder: (ctx, i) {
                   if (i == visibleOptions.length) {
                     return _buildLoadMoreFooter(
@@ -1103,7 +1470,9 @@ class _TreepHomeState extends State<TreepHome> {
                   final mins = o.nextEta.difference(DateTime.now()).inMinutes;
                   return ListTile(
                     title: Text('→ ${o.label}'),
-                    subtitle: Text('Next in ${mins}m • ${_hhmm(o.nextEta)} • ${o.visibleCount} upcoming'),
+                    subtitle: Text(
+                      'Next in ${mins}m • ${_hhmm(o.nextEta)} • ${o.visibleCount} upcoming',
+                    ),
                     onTap: () => Navigator.of(ctx).pop(o.key),
                   );
                 },
@@ -1114,20 +1483,27 @@ class _TreepHomeState extends State<TreepHome> {
       },
     );
 
-    return picked ?? options.first.key;
+    return picked;
   }
 
-  Future<TripCandidate> _pickTripInDirectionBottomSheet({
+  Future<TripCandidate?> _pickTripInDirectionBottomSheet({
     required List<TripCandidate> candidates,
   }) async {
-    final list = [...candidates]..sort((a, b) => a.etaLocal.compareTo(b.etaLocal));
-    final initialWindowHours = _upcomingWindowHours.clamp(2, _maxPickerHorizonHours);
+    final list = [...candidates]
+      ..sort((a, b) => a.etaLocal.compareTo(b.etaLocal));
+    final initialWindowHours = _upcomingWindowHours.clamp(
+      2,
+      _maxPickerHorizonHours,
+    );
     final anchor = DateTime.now();
-    for (final c in list) {
+    for (final c in list.take(12)) {
       _trace(
         'Trip-picker candidate eta=${c.etaLocal.toIso8601String()} '
         'displayTrain="${c.displayTrain}" terminal="${_terminalLabel(c)}" tripId=${c.tripId}',
       );
+    }
+    if (list.length > 12) {
+      _trace('Trip-picker candidates truncated=${list.length - 12}');
     }
 
     final picked = await showModalBottomSheet<TripCandidate>(
@@ -1167,7 +1543,9 @@ class _TreepHomeState extends State<TreepHome> {
               var nextVisible = oldVisible;
               while (nextHours < _maxPickerHorizonHours) {
                 nextHours += initialWindowHours;
-                if (nextHours > _maxPickerHorizonHours) nextHours = _maxPickerHorizonHours;
+                if (nextHours > _maxPickerHorizonHours) {
+                  nextHours = _maxPickerHorizonHours;
+                }
                 nextVisible = visibleConnectionsForHours(nextHours);
                 if (nextVisible.length > oldVisible.length) break;
                 if (nextHours >= _maxPickerHorizonHours) break;
@@ -1196,8 +1574,9 @@ class _TreepHomeState extends State<TreepHome> {
                 ),
                 padding: const EdgeInsets.symmetric(vertical: 8),
                 itemCount: visibleConnections.length + 1,
-                separatorBuilder: (_, i) =>
-                    i >= visibleConnections.length - 1 ? const SizedBox.shrink() : const Divider(height: 1),
+                separatorBuilder: (_, i) => i >= visibleConnections.length - 1
+                    ? const SizedBox.shrink()
+                    : const Divider(height: 1),
                 itemBuilder: (ctx, i) {
                   if (i == visibleConnections.length) {
                     return _buildLoadMoreFooter(
@@ -1208,7 +1587,9 @@ class _TreepHomeState extends State<TreepHome> {
                           'No more connections in the next $_maxPickerHorizonHours hours',
                       onTap: () {
                         _trace('Picker connections footer tapped');
-                        _trace('Picker connections load triggered source=footer-tap');
+                        _trace(
+                          'Picker connections load triggered source=footer-tap',
+                        );
                         loadMore();
                       },
                     );
@@ -1217,7 +1598,9 @@ class _TreepHomeState extends State<TreepHome> {
                   final mins = c.etaLocal.difference(DateTime.now()).inMinutes;
                   return ListTile(
                     title: Text('${_hhmm(c.etaLocal)} (in ${mins}m)'),
-                    subtitle: Text('${c.displayTrain} → ${_terminalLabel(c)} • ${_fmtDelay(c.delaySeconds)}'),
+                    subtitle: Text(
+                      '${c.displayTrain} → ${_terminalLabel(c)} • ${_fmtDelay(c.delaySeconds)}',
+                    ),
                     onTap: () => Navigator.of(ctx).pop(c),
                   );
                 },
@@ -1228,8 +1611,9 @@ class _TreepHomeState extends State<TreepHome> {
       },
     );
 
-    return picked ?? list.first;
+    return picked;
   }
+
   @override
   void dispose() {
     _sliderDebounce?.cancel();
@@ -1249,6 +1633,9 @@ class _TreepHomeState extends State<TreepHome> {
 
     _selfTestHapticTimer?.cancel();
     _selfTestHapticTimer = null;
+
+    _sleepOverlayTimer?.cancel();
+    _sleepOverlayTimer = null;
 
     _trainController.dispose();
     _stationController.dispose();
@@ -1340,14 +1727,18 @@ class _TreepHomeState extends State<TreepHome> {
         final destCanon = _normalizeStopId(effectiveDest) ?? effectiveDest;
 
         setState(() {
-          _trackingStatus = 'Checking upcoming arrivals at ${_stopLabel(destCanon)}…';
+          _trackingStatus =
+              'Checking upcoming arrivals at ${_stopLabel(destCanon)}…';
         });
 
         final arrivalCandidates = await _fallbackArrivalsAtDestination(
           trainQuery: '',
-          destStopIdCanons: destWasName ? destAlternatives : <String>[destCanon],
+          destStopIdCanons: destWasName
+              ? destAlternatives
+              : <String>[destCanon],
           destNameQuery: destWasName ? destQuery : null,
           limit: 100,
+          resolveDestinationName: false,
         );
 
         if (!mounted) return;
@@ -1368,10 +1759,14 @@ class _TreepHomeState extends State<TreepHome> {
 
         // Treat this as a destination-arrivals based selection.
         var candidates = _dedupeCandidatesViaService(arrivalCandidates);
-        candidates = _dropPastCandidates(candidates, stage: 'No-train fallback pool');
+        candidates = _dropPastCandidates(
+          candidates,
+          stage: 'No-train fallback pool',
+        );
         if (candidates.isEmpty) {
           setState(() {
-            _trackingStatus = 'No upcoming arrivals found (stale candidates removed).';
+            _trackingStatus =
+                'No upcoming arrivals found (stale candidates removed).';
           });
           return;
         }
@@ -1405,13 +1800,22 @@ class _TreepHomeState extends State<TreepHome> {
           final key = _directionKey(c);
           byDir.putIfAbsent(key, () => <TripCandidate>[]).add(c);
         }
-        _traceDirectionBuckets('Direction-grouping startTracking-noTrain', byDir);
+        _traceDirectionBuckets(
+          'Direction-grouping startTracking-noTrain',
+          byDir,
+        );
 
-        final dirKeys = byDir.keys.where((k) => k != 'unknown' && k.isNotEmpty).toList();
+        final dirKeys = byDir.keys
+            .where((k) => k != 'unknown' && k.isNotEmpty)
+            .toList();
 
-        String chosenDir = 'unknown';
+        String? chosenDir = 'unknown';
         if (dirKeys.length > 1) {
           chosenDir = await _pickDirectionBottomSheet(candidates);
+          if (chosenDir == null) {
+            _cancelTrackingSelection('no-train-direction-picker');
+            return;
+          }
         } else if (dirKeys.length == 1) {
           chosenDir = dirKeys.first;
         }
@@ -1438,15 +1842,24 @@ class _TreepHomeState extends State<TreepHome> {
           source: 'fallback-arrivals-no-train',
         );
 
-        TripCandidate chosen;
+        late final TripCandidate chosen;
         if (dirCandidates.length == 1) {
           chosen = dirCandidates.first;
         } else {
-          chosen = await _pickTripInDirectionBottomSheet(
+          final picked = await _pickTripInDirectionBottomSheet(
             candidates: dirCandidates,
           );
+          if (picked == null) {
+            _cancelTrackingSelection('no-train-trip-picker');
+            return;
+          }
+          chosen = picked;
         }
-        _traceCandidate('Final-selection chosen', chosen, source: 'fallback-arrivals-no-train');
+        _traceCandidate(
+          'Final-selection chosen',
+          chosen,
+          source: 'fallback-arrivals-no-train',
+        );
         _trace('Final-selection reason=fallback-arrivals-no-train');
 
         if (!mounted) return;
@@ -1464,7 +1877,11 @@ class _TreepHomeState extends State<TreepHome> {
               'Selected ${chosen.displayTrain} → $niceStop • ETA ${_hhmm(chosen.etaLocal)} (in ${minsLeft}m) • ${_fmtDelay(chosen.delaySeconds)}'
               '\n(Fallback: destination arrivals)';
         });
-        _traceCandidate('selectedCandidate assigned', chosen, source: 'fallback-arrivals-no-train');
+        _traceCandidate(
+          'selectedCandidate assigned',
+          chosen,
+          source: 'fallback-arrivals-no-train',
+        );
 
         await _armAlarmFor(chosen, showUx: false);
         if (!mounted) return;
@@ -1484,10 +1901,10 @@ class _TreepHomeState extends State<TreepHome> {
         var candidates = <TripCandidate>[];
 
         if (destWasName) {
-          final resolvedIds = await _resolveStopIdsFromName(destQuery);
-          final idsToTry = resolvedIds.isNotEmpty ? resolvedIds : destAlternatives;
+          final idsToTry = destAlternatives;
 
-          for (final id in idsToTry.isEmpty ? <String>[effectiveDest] : idsToTry) {
+          for (final id
+              in idsToTry.isEmpty ? <String>[effectiveDest] : idsToTry) {
             candidates.addAll(
               _findCandidates(
                 feed,
@@ -1507,7 +1924,11 @@ class _TreepHomeState extends State<TreepHome> {
           );
         }
         _traceStageCandidates('GTFS strict leave $scenarioTag', candidates);
-        _traceCandidatePool('GTFS-RT candidate pool', candidates, source: 'gtfs-rt-strict');
+        _traceCandidatePool(
+          'GTFS-RT candidate pool',
+          candidates,
+          source: 'gtfs-rt-strict',
+        );
 
         // Warm station name cache for the destination itself (nice labels).
         final destCanonWarm = _normalizeStopId(effectiveDest) ?? effectiveDest;
@@ -1516,17 +1937,98 @@ class _TreepHomeState extends State<TreepHome> {
         bool usedArrivalsFallback = false;
         bool usedGtfsBridge = false;
         final hadStrictMatch = candidates.isNotEmpty;
+        var candidateSource = hadStrictMatch ? 'gtfs-rt-strict' : 'none';
         var trainFallbackBroadCount = 0;
         var trainFallbackFilteredCount = 0;
         var trainFallbackStaleRemoved = 0;
         var trainFallbackFinalCount = 0;
         var trainFallbackAttempted = false;
 
+        final isLocalLineQuery =
+            MatchingService.gtfsBridgeDecisionReason(trainQuery) ==
+            'local-s-line';
+        if (candidates.isNotEmpty && isLocalLineQuery) {
+          final destCanon = _normalizeStopId(effectiveDest) ?? effectiveDest;
+          final localDirectionCandidates = await _fallbackArrivalsAtDestination(
+            trainQuery: trainQuery,
+            destStopIdCanons: destWasName
+                ? destAlternatives
+                : <String>[destCanon],
+            destNameQuery: destWasName ? destQuery : null,
+            limit: 220,
+            resolveDestinationName: false,
+          );
+          if (!mounted) return;
+
+          final enrichment = enrichLocalLineDirections(
+            gtfsCandidates: candidates,
+            stationboardCandidates: localDirectionCandidates,
+            trainQuery: trainQuery,
+            stopIdsMatch: _stopIdMatches,
+            directionLabel: _terminalLabel,
+          );
+          candidates = enrichment.candidates;
+          if (enrichment.enrichedCount > 0) {
+            candidateSource = 'gtfs-rt-local-direction-enriched';
+          }
+          _trace(
+            'Local-line direction enrichment gtfsCount=${candidates.length} '
+            'stationboardCount=${localDirectionCandidates.length} '
+            'enrichedCount=${enrichment.enrichedCount}',
+          );
+          for (final decision in enrichment.decisions.take(12)) {
+            final counterpart = decision.counterpart;
+            _trace(
+              'Local-line direction decision gtfsTripId=${decision.original.tripId} '
+              'gtfsEta=${decision.original.etaLocal.toIso8601String()} '
+              'gtfsDirection="${_terminalLabel(decision.original)}" '
+              'stationboardTripId=${counterpart?.tripId ?? "none"} '
+              'stationboardEta=${counterpart?.etaLocal.toIso8601String() ?? "none"} '
+              'stationboardDirection="${counterpart == null ? "" : _terminalLabel(counterpart)}" '
+              'etaDiffSec=${decision.etaDifferenceSeconds ?? -1} '
+              'result=${decision.reason} '
+              'finalDirection="${_terminalLabel(decision.result)}"',
+            );
+          }
+          if (enrichment.decisions.length > 12) {
+            _trace(
+              'Local-line direction decisions truncated=${enrichment.decisions.length - 12}',
+            );
+          }
+        }
+
+        // A destination-aware name rescue is more trustworthy than broad
+        // train-only GTFS results and must run before either broad fallback.
+        if (candidates.isEmpty && destWasName) {
+          final nameMatched = await _findCandidatesByTrainAndDestinationName(
+            feed,
+            trainQuery,
+            destQuery,
+          );
+
+          if (!mounted) return;
+          if (nameMatched.isNotEmpty) {
+            candidates = nameMatched;
+            candidateSource = 'gtfs-stop-name-rescue';
+            _traceCandidatePool(
+              'GTFS-name-match candidate pool',
+              candidates,
+              source: candidateSource,
+            );
+            setState(() {
+              _trackingStatus =
+                  'Destination matched by name: “$destQuery” (from train stops) — pick the right trip if needed.';
+            });
+          }
+        }
+
         // If GTFS-RT did not find a strict match, prefer stationboard (arrivals) as the next step.
         // This produces much nicer direction labels ("to") and often has better coverage.
         if (candidates.isEmpty) {
           final destCanon = _normalizeStopId(effectiveDest) ?? effectiveDest;
-          final resolvedForFallback = destWasName ? destAlternatives : <String>[destCanon];
+          final resolvedForFallback = destWasName
+              ? destAlternatives
+              : <String>[destCanon];
           final queryNorm = _normalizeTrainToken(trainQuery);
           _trace(
             'Train query fallback-first mode query="$trainQuery" queryNorm="$queryNorm" '
@@ -1534,7 +2036,8 @@ class _TreepHomeState extends State<TreepHome> {
           );
 
           setState(() {
-            _trackingStatus = 'No GTFS-RT match yet. Checking upcoming arrivals at ${_stopLabel(destCanon)}…';
+            _trackingStatus =
+                'No GTFS-RT match yet. Checking upcoming arrivals at ${_stopLabel(destCanon)}…';
           });
 
           final broadArrivalCandidates = await _fallbackArrivalsAtDestination(
@@ -1542,10 +2045,14 @@ class _TreepHomeState extends State<TreepHome> {
             destStopIdCanons: resolvedForFallback,
             destNameQuery: destWasName ? destQuery : null,
             limit: 220,
+            resolveDestinationName: false,
           );
 
           if (!mounted) return;
-          _traceStageCandidates('Fallback broad leave $scenarioTag', broadArrivalCandidates);
+          _traceStageCandidates(
+            'Fallback broad leave $scenarioTag',
+            broadArrivalCandidates,
+          );
           if (broadArrivalCandidates.isNotEmpty) {
             final sortedBroad = [...broadArrivalCandidates]
               ..sort((a, b) => a.etaLocal.compareTo(b.etaLocal));
@@ -1557,11 +2064,15 @@ class _TreepHomeState extends State<TreepHome> {
             _trace('Train-specific fallback broad minEta=none maxEta=none');
           }
 
-          _trace('Train-specific fallback broad pool count=${broadArrivalCandidates.length} queryNorm="$queryNorm"');
+          _trace(
+            'Train-specific fallback broad pool count=${broadArrivalCandidates.length} queryNorm="$queryNorm"',
+          );
           trainFallbackAttempted = true;
           trainFallbackBroadCount = broadArrivalCandidates.length;
           if (broadArrivalCandidates.isEmpty) {
-            _trace('Train-specific fallback no-match reason=broad_pool_empty queryNorm="$queryNorm"');
+            _trace(
+              'Train-specific fallback no-match reason=broad_pool_empty queryNorm="$queryNorm"',
+            );
           }
 
           final postFallback = _runTrainQueryFallbackPostPipeline(
@@ -1570,23 +2081,34 @@ class _TreepHomeState extends State<TreepHome> {
             broadArrivalCandidates: broadArrivalCandidates,
           );
           trainFallbackFilteredCount = postFallback.filtered.length;
-          trainFallbackStaleRemoved = postFallback.filtered.length - postFallback.fresh.length;
+          trainFallbackStaleRemoved =
+              postFallback.filtered.length - postFallback.fresh.length;
           trainFallbackFinalCount = postFallback.deduped.length;
 
           if (postFallback.filtered.isEmpty) {
-            _trace('Train-specific fallback no public-label match queryNorm="$queryNorm"');
-            _trace('Train-specific fallback no-match reason=filtered_pool_empty queryNorm="$queryNorm"');
+            _trace(
+              'Train-specific fallback no public-label match queryNorm="$queryNorm"',
+            );
+            _trace(
+              'Train-specific fallback no-match reason=filtered_pool_empty queryNorm="$queryNorm"',
+            );
           }
 
           if (postFallback.fresh.isEmpty && postFallback.filtered.isNotEmpty) {
-            _trace('Train-specific fallback no-match reason=all_filtered_removed_as_stale queryNorm="$queryNorm"');
+            _trace(
+              'Train-specific fallback no-match reason=all_filtered_removed_as_stale queryNorm="$queryNorm"',
+            );
           }
           if (postFallback.deduped.isEmpty && postFallback.fresh.isNotEmpty) {
-            _trace('Train-specific fallback no-match reason=all_removed_by_dedupe queryNorm="$queryNorm"');
+            _trace(
+              'Train-specific fallback no-match reason=all_removed_by_dedupe queryNorm="$queryNorm"',
+            );
           }
 
           if (postFallback.deduped.isNotEmpty) {
-            _trace('Train-specific fallback final pool count=${postFallback.deduped.length}');
+            _trace(
+              'Train-specific fallback final pool count=${postFallback.deduped.length}',
+            );
             for (final c in postFallback.deduped) {
               _trace(
                 'Train-specific final fallback candidate displayTrain="${c.displayTrain}" '
@@ -1596,14 +2118,22 @@ class _TreepHomeState extends State<TreepHome> {
 
             candidates = postFallback.deduped;
             usedArrivalsFallback = true;
+            candidateSource = 'fallback-arrivals-train-filtered';
 
-            final bridgeReason = MatchingService.gtfsBridgeDecisionReason(trainQuery);
-            final bridgeEnabled = MatchingService.shouldUseGtfsBridgeForQueryWithLocalGuard(trainQuery);
+            final bridgeReason = MatchingService.gtfsBridgeDecisionReason(
+              trainQuery,
+            );
+            final bridgeEnabled =
+                MatchingService.shouldUseGtfsBridgeForQueryWithLocalGuard(
+                  trainQuery,
+                );
             _trace(
               'GTFS bridge enabled queryNorm="$queryNorm" strictPoolEmpty=true fallbackCount=${postFallback.deduped.length} enabled=$bridgeEnabled reason=$bridgeReason',
             );
             if (!bridgeEnabled && bridgeReason == 'local-s-line') {
-              _trace('GTFS bridge skipped for local-line queryNorm="$queryNorm"');
+              _trace(
+                'GTFS bridge skipped for local-line queryNorm="$queryNorm"',
+              );
             }
 
             if (bridgeEnabled) {
@@ -1622,9 +2152,12 @@ class _TreepHomeState extends State<TreepHome> {
                   bridgedPool.add(fb);
                 }
               }
-              _trace('Train-specific fallback bridge enriched count=$bridgedCount total=${bridgedPool.length}');
+              _trace(
+                'Train-specific fallback bridge enriched count=$bridgedCount total=${bridgedPool.length}',
+              );
               if (bridgedCount > 0) {
                 usedGtfsBridge = true;
+                candidateSource = 'gtfs-bridge-from-fallback';
                 candidates = _dedupeCandidatesViaService(bridgedPool);
                 _traceCandidatePool(
                   'GTFS bridge candidate pool',
@@ -1637,13 +2170,18 @@ class _TreepHomeState extends State<TreepHome> {
               'Train query fallback-first final selection pool count=${candidates.length} '
               'source=${usedGtfsBridge ? "gtfs-bridge" : "fallback"}',
             );
-            _traceStageCandidates('Selection input leave $scenarioTag', candidates);
+            _traceStageCandidates(
+              'Selection input leave $scenarioTag',
+              candidates,
+            );
 
             await _warmStopNamesForCandidates(candidates);
             _traceCandidatePool(
               'Fallback arrivals candidate pool',
               candidates,
-              source: usedGtfsBridge ? 'gtfs-bridge-from-fallback' : 'fallback-arrivals-train-filtered',
+              source: usedGtfsBridge
+                  ? 'gtfs-bridge-from-fallback'
+                  : 'fallback-arrivals-train-filtered',
             );
 
             setState(() {
@@ -1653,8 +2191,8 @@ class _TreepHomeState extends State<TreepHome> {
           }
         }
 
-        // If we still have nothing, keep the older GTFS-based fallbacks.
-        // Fallback 1: still require the train match, but allow any destination.
+        // True last resort: keep train matching but allow an unverified
+        // destination. Candidate-specific confirmation remains mandatory below.
         if (candidates.isEmpty) {
           candidates = _findCandidates(
             feed,
@@ -1662,34 +2200,22 @@ class _TreepHomeState extends State<TreepHome> {
             effectiveDest,
             requireDestinationMatch: false,
           );
-        }
-
-        // Fallback 2 (important): if the user typed a destination *name* (e.g. "Oensingen") and we
-        // couldn't match by stop_id, try matching against stop *names* inside the train's upcoming stops.
-        if (candidates.isEmpty && destWasName) {
-          final nameMatched = await _findCandidatesByTrainAndDestinationName(
-            feed,
-            trainQuery,
-            destQuery,
-          );
-
-          if (!mounted) return;
-
-          if (nameMatched.isNotEmpty) {
-            candidates = nameMatched;
+          if (candidates.isNotEmpty) {
+            candidateSource = 'gtfs-train-only-unverified';
             _traceCandidatePool(
-              'GTFS-name-match candidate pool',
+              'GTFS broad train-only candidate pool',
               candidates,
-              source: 'gtfs-stop-name-fallback',
+              source: candidateSource,
             );
             setState(() {
               _trackingStatus =
-                  'Destination matched by name: “$destQuery” (from train stops) — pick the right trip if needed.';
+                  'Only train matches were found. Destination confirmation will be required before tracking starts.';
             });
           }
         }
 
-        // Fallback 3: only when train query is empty — show trips that go to the destination.
+        // This branch is retained for compatibility if the surrounding flow is
+        // later reused without a train query.
         if (candidates.isEmpty && trainQuery.trim().isEmpty) {
           candidates = _findCandidates(
             feed,
@@ -1729,9 +2255,12 @@ class _TreepHomeState extends State<TreepHome> {
           // As a final attempt, try stationboard without filtering (sometimes route ids are weird).
           final arrivalCandidates = await _fallbackArrivalsAtDestination(
             trainQuery: '',
-            destStopIdCanons: destWasName ? destAlternatives : <String>[destCanon],
+            destStopIdCanons: destWasName
+                ? destAlternatives
+                : <String>[destCanon],
             destNameQuery: destWasName ? destQuery : null,
             limit: 100,
+            resolveDestinationName: false,
           );
 
           if (!mounted) return;
@@ -1751,6 +2280,7 @@ class _TreepHomeState extends State<TreepHome> {
           }
 
           usedArrivalsFallback = true;
+          candidateSource = 'fallback-arrivals-unfiltered';
           candidates = _dedupeCandidatesViaService(arrivalCandidates);
           await _warmStopNamesForCandidates(candidates);
           _traceCandidatePool(
@@ -1776,6 +2306,10 @@ class _TreepHomeState extends State<TreepHome> {
         }
         await Future.wait(terminalIds.map(_ensureStopName));
 
+        _trace(
+          'Search candidate source selected=$candidateSource count=${candidates.length}',
+        );
+
         final Map<String, List<TripCandidate>> byDir = {};
         for (final c in candidates) {
           final key = _directionKey(c);
@@ -1783,11 +2317,17 @@ class _TreepHomeState extends State<TreepHome> {
         }
         _traceDirectionBuckets('Direction-grouping startTracking-train', byDir);
 
-        final dirKeys = byDir.keys.where((k) => k != 'unknown' && k.isNotEmpty).toList();
+        final dirKeys = byDir.keys
+            .where((k) => k != 'unknown' && k.isNotEmpty)
+            .toList();
 
-        String chosenDir = 'unknown';
+        String? chosenDir = 'unknown';
         if (dirKeys.length > 1) {
           chosenDir = await _pickDirectionBottomSheet(candidates);
+          if (chosenDir == null) {
+            _cancelTrackingSelection('train-direction-picker');
+            return;
+          }
         } else if (dirKeys.length == 1) {
           chosenDir = dirKeys.first;
         }
@@ -1802,7 +2342,10 @@ class _TreepHomeState extends State<TreepHome> {
           dirCandidates,
           stage: 'Train-path direction pool',
         );
-        _traceStageCandidates('Direction pool leave $scenarioTag', dirCandidates);
+        _traceStageCandidates(
+          'Direction pool leave $scenarioTag',
+          dirCandidates,
+        );
         if (dirCandidates.isEmpty) {
           setState(() {
             _trackingStatus = 'No upcoming trips left in this direction.';
@@ -1813,36 +2356,39 @@ class _TreepHomeState extends State<TreepHome> {
         _traceCandidatePool(
           'Final-selection pool',
           candidates,
-          source: usedGtfsBridge ? 'gtfs-bridge' : (usedArrivalsFallback ? 'fallback-arrivals' : 'gtfs-rt'),
+          source: candidateSource,
         );
         _traceCandidatePool(
           'Final-selection direction pool',
           dirCandidates.take(_pickerTakePerDirection()).toList(),
-          source: usedGtfsBridge ? 'gtfs-bridge' : (usedArrivalsFallback ? 'fallback-arrivals' : 'gtfs-rt'),
+          source: candidateSource,
         );
 
-        TripCandidate chosen;
+        late TripCandidate chosen;
         if (dirCandidates.length == 1) {
           chosen = dirCandidates.first;
         } else {
-          chosen = await _pickTripInDirectionBottomSheet(
+          final picked = await _pickTripInDirectionBottomSheet(
             candidates: dirCandidates,
           );
+          if (picked == null) {
+            _cancelTrackingSelection('train-trip-picker');
+            return;
+          }
+          chosen = picked;
         }
         _traceCandidate(
           'Final-selection chosen',
           chosen,
-          source: usedGtfsBridge ? 'gtfs-bridge' : (usedArrivalsFallback ? 'fallback-arrivals' : 'gtfs-rt'),
+          source: candidateSource,
         );
-        _trace(
-          'Final-selection reason=${usedGtfsBridge ? "gtfs-bridge" : (usedArrivalsFallback ? "fallback-arrivals" : "gtfs-rt")}',
-        );
+        _trace('Final-selection reason=$candidateSource');
         _trace('Pipeline leave $scenarioTag chosenTripId=${chosen.tripId}');
 
         if (!mounted) return;
 
         // If destination wasn't matched during fallback search, let the user pick a stop from upcoming stops.
-        if (!hadStrictMatch && !chosen.destinationMatched) {
+        if (candidateNeedsDestinationConfirmation(chosen)) {
           final pickedStop = await _pickStopBottomSheet(
             title: 'Pick destination stop',
             stops: chosen.upcomingStops,
@@ -1868,13 +2414,13 @@ class _TreepHomeState extends State<TreepHome> {
         setState(() {
           _selectedCandidate = chosen;
           _trackingStatus =
-            'Selected ${chosen.displayTrain} → $niceStop • ETA ${_hhmm(chosen.etaLocal)} (in ${minsLeft}m) • ${_fmtDelay(chosen.delaySeconds)}'
-        '${usedArrivalsFallback ? "\n(Fallback: destination arrivals)" :""}';
+              'Selected ${chosen.displayTrain} → $niceStop • ETA ${_hhmm(chosen.etaLocal)} (in ${minsLeft}m) • ${_fmtDelay(chosen.delaySeconds)}'
+              '${usedArrivalsFallback ? "\n(Fallback: destination arrivals)" : ""}';
         });
         _traceCandidate(
           'selectedCandidate assigned',
           chosen,
-          source: usedGtfsBridge ? 'gtfs-bridge' : (usedArrivalsFallback ? 'fallback-arrivals' : 'gtfs-rt'),
+          source: candidateSource,
         );
 
         await _armAlarmFor(chosen, showUx: false);
@@ -1884,13 +2430,26 @@ class _TreepHomeState extends State<TreepHome> {
         );
         return;
       }
-    } catch (e) {
+    } catch (error, stackTrace) {
+      final stackPreview = stackTrace
+          .toString()
+          .split('\n')
+          .take(8)
+          .join(' | ');
+      _trace(
+        'Start tracking failed errorType=${error.runtimeType} error="$error" '
+        'stack="$stackPreview"',
+      );
       if (!mounted) return;
-      setState(() { 
-             _trackingStatus = 'Start tracking failed: $e';
+      setState(() {
+        _trackingStatus = 'Search failed. Check your connection and try again.';
       });
       ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text('Start tracking failed: $e')),
+        const SnackBar(
+          content: Text(
+            'Search failed. Please check your connection and retry.',
+          ),
+        ),
       );
     } finally {
       if (mounted) {
@@ -1899,27 +2458,33 @@ class _TreepHomeState extends State<TreepHome> {
     }
   }
 
-  Future<http.Response> _getGtfsRtResponse() async => _transportService.getGtfsRtResponse();
+  Future<http.Response> _getGtfsRtResponse() async =>
+      _transportService.getGtfsRtResponse();
 
-  Future<FeedMessage> _fetchGtfsRtFeed() async => _transportService.fetchGtfsRtFeed();
+  Future<FeedMessage> _fetchGtfsRtFeed() async =>
+      _transportService.fetchGtfsRtFeed();
 
   Future<List<TripCandidate>> _fallbackArrivalsAtDestination({
     required String trainQuery,
     required List<String> destStopIdCanons,
     String? destNameQuery,
     int limit = 100,
+    bool resolveDestinationName = true,
   }) async {
     return _transportService.fallbackArrivalsAtDestination(
       trainQuery: trainQuery,
       destStopIdCanons: destStopIdCanons,
       destNameQuery: destNameQuery,
       limit: limit,
+      resolveDestinationName: resolveDestinationName,
     );
   }
 
-Future<List<String>> _resolveStopIdsFromName(String query) async => _transportService.resolveStopIdsFromName(query);
+  Future<List<String>> _resolveStopIdsFromName(String query) async =>
+      _transportService.resolveStopIdsFromName(query);
 
-  String? _normalizeStopId(String raw) => _transportService.normalizeStopId(raw);
+  String? _normalizeStopId(String raw) =>
+      _transportService.normalizeStopId(raw);
 
   List<TripCandidate> _findCandidates(
     FeedMessage feed,
@@ -1935,57 +2500,64 @@ Future<List<String>> _resolveStopIdsFromName(String query) async => _transportSe
     );
   }
 
-Future<StopEta?> _pickStopBottomSheet({
-  required String title,
-  required List<StopEta> stops,
-}) async {
-  final sorted = [...stops]..sort((a, b) => a.etaLocal.compareTo(b.etaLocal));
+  Future<StopEta?> _pickStopBottomSheet({
+    required String title,
+    required List<StopEta> stops,
+  }) async {
+    final sorted = [...stops]..sort((a, b) => a.etaLocal.compareTo(b.etaLocal));
 
-  return showModalBottomSheet<StopEta>(
-    context: context,
-    showDragHandle: true,
-    builder: (ctx) {
-      return SafeArea(
-        child: Column(
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            Padding(
-              padding: const EdgeInsets.fromLTRB(16, 8, 16, 8),
-              child: Row(
-                children: [
-                  Text(title, style: const TextStyle(fontWeight: FontWeight.bold)),
-                  const Spacer(),
-                  Text('${sorted.length} stops'),
-                ],
-              ),
-            ),
-            const Divider(height: 1),
-            Flexible(
-              child: ListView.separated(
-                padding: const EdgeInsets.symmetric(vertical: 8),
-                itemCount: sorted.length,
-                separatorBuilder: (_, unusedIndex) => const Divider(height: 1),
-                itemBuilder: (ctx, i) {
-                  final s = sorted[i];
-                  final mins = s.etaLocal.difference(DateTime.now()).inMinutes;
-                  return ListTile(
-                    title: Text(_stopLabel(s.stopIdRaw)),
-                    subtitle: Text(
-                      'ETA ${_hhmm(s.etaLocal)} (in ${mins}m) • ${_fmtDelay(s.delaySeconds)}',
+    return showModalBottomSheet<StopEta>(
+      context: context,
+      showDragHandle: true,
+      builder: (ctx) {
+        return SafeArea(
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Padding(
+                padding: const EdgeInsets.fromLTRB(16, 8, 16, 8),
+                child: Row(
+                  children: [
+                    Text(
+                      title,
+                      style: const TextStyle(fontWeight: FontWeight.bold),
                     ),
-                    onTap: () => Navigator.of(ctx).pop(s),
-                  );
-                },
+                    const Spacer(),
+                    Text('${sorted.length} stops'),
+                  ],
+                ),
               ),
-            ),
-          ],
-        ),
-      );
-    },
-  );
-}
-// Backwards-compat: UI calls `_testFeed`.
-Future<void> _testFeed() async => _pingApi();
+              const Divider(height: 1),
+              Flexible(
+                child: ListView.separated(
+                  padding: const EdgeInsets.symmetric(vertical: 8),
+                  itemCount: sorted.length,
+                  separatorBuilder: (_, unusedIndex) =>
+                      const Divider(height: 1),
+                  itemBuilder: (ctx, i) {
+                    final s = sorted[i];
+                    final mins = s.etaLocal
+                        .difference(DateTime.now())
+                        .inMinutes;
+                    return ListTile(
+                      title: Text(_stopLabel(s.stopIdRaw)),
+                      subtitle: Text(
+                        'ETA ${_hhmm(s.etaLocal)} (in ${mins}m) • ${_fmtDelay(s.delaySeconds)}',
+                      ),
+                      onTap: () => Navigator.of(ctx).pop(s),
+                    );
+                  },
+                ),
+              ),
+            ],
+          ),
+        );
+      },
+    );
+  }
+
+  // Backwards-compat: UI calls `_testFeed`.
+  Future<void> _testFeed() async => _pingApi();
 
   Future<void> _pingApi() async {
     if (_isTestingFeed) return;
@@ -1994,9 +2566,9 @@ Future<void> _testFeed() async => _pingApi();
 
     // Immediate UI feedback so the user sees the tap worked.
     ScaffoldMessenger.of(context).hideCurrentSnackBar();
-    ScaffoldMessenger.of(context).showSnackBar(
-      const SnackBar(content: Text('Testing GTFS-RT feed…')),
-    );
+    ScaffoldMessenger.of(
+      context,
+    ).showSnackBar(const SnackBar(content: Text('Testing GTFS-RT feed…')));
 
     if (key == null || key.trim().isEmpty || key == 'YOUR_API_KEY') {
       ScaffoldMessenger.of(context).hideCurrentSnackBar();
@@ -2032,11 +2604,15 @@ Future<void> _testFeed() async => _pingApi();
       // If the endpoint ever returns JSON, show a tiny preview (safe).
       if (contentType.contains('json')) {
         final preview = utf8.decode(res.bodyBytes, allowMalformed: true);
-        final shortPreview = preview.length > 140 ? preview.substring(0, 140) : preview;
+        final shortPreview = preview.length > 140
+            ? preview.substring(0, 140)
+            : preview;
         ScaffoldMessenger.of(context).hideCurrentSnackBar();
         ScaffoldMessenger.of(context).showSnackBar(
           SnackBar(
-            content: Text('GTFS-RT JSON: $sizeBytes bytes | ${shortPreview.replaceAll('\n', ' ')}'),
+            content: Text(
+              'GTFS-RT JSON: $sizeBytes bytes | ${shortPreview.replaceAll('\n', ' ')}',
+            ),
             duration: const Duration(seconds: 7),
           ),
         );
@@ -2049,7 +2625,9 @@ Future<void> _testFeed() async => _pingApi();
         feed = FeedMessage.fromBuffer(res.bodyBytes);
       } catch (e) {
         final head = res.bodyBytes.take(_upcomingTripsLimit).toList();
-        final hex = head.map((b) => b.toRadixString(16).padLeft(2, '0')).join(' ');
+        final hex = head
+            .map((b) => b.toRadixString(16).padLeft(2, '0'))
+            .join(' ');
         ScaffoldMessenger.of(context).hideCurrentSnackBar();
         ScaffoldMessenger.of(context).showSnackBar(
           SnackBar(
@@ -2073,7 +2651,10 @@ Future<void> _testFeed() async => _pingApi();
       String timeInfo = '';
       if (feed.header.hasTimestamp()) {
         final ts = feed.header.timestamp.toInt(); // seconds since epoch
-        final dt = DateTime.fromMillisecondsSinceEpoch(ts * 1000, isUtc: true).toLocal();
+        final dt = DateTime.fromMillisecondsSinceEpoch(
+          ts * 1000,
+          isUtc: true,
+        ).toLocal();
         timeInfo = ' | ${dt.toIso8601String()}';
       }
 
@@ -2091,9 +2672,9 @@ Future<void> _testFeed() async => _pingApi();
     } catch (e) {
       if (!mounted) return;
       ScaffoldMessenger.of(context).hideCurrentSnackBar();
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text('GTFS-RT test failed: $e')),
-      );
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(SnackBar(content: Text('GTFS-RT test failed: $e')));
     } finally {
       if (mounted) setState(() => _isTestingFeed = false);
     }
@@ -2170,7 +2751,9 @@ Future<void> _testFeed() async => _pingApi();
                   const SizedBox(height: 8),
                   ElevatedButton(
                     onPressed: _isStartingTracking ? null : _startTracking,
-                    child: Text(_isStartingTracking ? 'Starting…' : 'Start tracking'),
+                    child: Text(
+                      _isStartingTracking ? 'Starting…' : 'Start tracking',
+                    ),
                   ),
 
                   const SizedBox(height: 8),
@@ -2190,7 +2773,10 @@ Future<void> _testFeed() async => _pingApi();
                     child: Column(
                       crossAxisAlignment: CrossAxisAlignment.stretch,
                       children: [
-                        const Text('Status', style: TextStyle(fontWeight: FontWeight.bold)),
+                        const Text(
+                          'Status',
+                          style: TextStyle(fontWeight: FontWeight.bold),
+                        ),
                         const SizedBox(height: 6),
                         Text(_trackingStatus.isEmpty ? '—' : _trackingStatus),
 
@@ -2199,12 +2785,16 @@ Future<void> _testFeed() async => _pingApi();
                           Text('${c.vehicleLabel}: ${c.displayTrain}'),
                           Text('Alarm at: ${_stopLabel(c.stopId)}'),
                           Text('Direction: ${_terminalLabel(c)}'),
-                          Text('Arrives: ${_hhmm(c.etaLocal)} • ${_fmtDelay(c.delaySeconds)}'),
+                          Text(
+                            'Arrives: ${_hhmm(c.etaLocal)} • ${_fmtDelay(c.delaySeconds)}',
+                          ),
                         ],
 
                         if (hasAlarm) ...[
                           const SizedBox(height: 10),
-                          Text('Alarm: armed for ${_hhmm(_alarmFirstFire!)} (repeats until you stop)'),
+                          Text(
+                            'Alarm: armed for ${_hhmm(_alarmFirstFire!)} (repeats until you stop)',
+                          ),
                           Text(
                             'Audio alarm: ${Platform.isIOS ? (_nativeAlarmArmed ? "ON" : "OFF (check iOS native)") : "(iOS only)"}',
                           ),
@@ -2222,7 +2812,9 @@ Future<void> _testFeed() async => _pingApi();
                                       backgroundColor: Colors.green,
                                       foregroundColor: Colors.white,
                                     ),
-                                    onPressed: c == null ? null : () => _armAlarmFor(c, showUx: true),
+                                    onPressed: c == null
+                                        ? null
+                                        : () => _armAlarmFor(c, showUx: true),
                                     child: const Text('Set alarm'),
                                   ),
                                 ),
@@ -2241,9 +2833,13 @@ Future<void> _testFeed() async => _pingApi();
                             ),
                             const SizedBox(height: 8),
                             OutlinedButton.icon(
-                              onPressed: _isSelfTesting ? null : _runAlarmSelfTest,
+                              onPressed: _isSelfTesting
+                                  ? null
+                                  : _runAlarmSelfTest,
                               icon: const Icon(Icons.volume_up_outlined),
-                              label: Text(_isSelfTesting ? 'Testing…' : 'Test alarm (3s)'),
+                              label: Text(
+                                _isSelfTesting ? 'Testing…' : 'Test alarm (3s)',
+                              ),
                             ),
                           ],
                         ),

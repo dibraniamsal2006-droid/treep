@@ -1,7 +1,6 @@
 import 'dart:async';
 import 'dart:convert';
 
-import 'package:flutter/foundation.dart';
 import 'package:flutter_dotenv/flutter_dotenv.dart';
 import 'package:gtfs_realtime_bindings/gtfs_realtime_bindings.dart';
 import 'package:http/http.dart' as http;
@@ -9,21 +8,86 @@ import 'package:http/http.dart' as http;
 import '../models/trip_candidate.dart';
 import 'matching_service.dart';
 
-typedef CandidateTracer = void Function(String stage, List<TripCandidate> candidates, {int max});
+typedef CandidateTracer =
+    void Function(String stage, List<TripCandidate> candidates, {int max});
+typedef TransportHttpGet =
+    Future<http.Response> Function(Uri uri, {Map<String, String>? headers});
+
+enum _FallbackPrognosisSource { scheduled, arrival, departureFallback }
+
+class _FallbackTiming {
+  const _FallbackTiming({
+    required this.scheduledLocal,
+    required this.etaLocal,
+    required this.delaySeconds,
+    required this.scheduledTimestamp,
+    required this.prognosisSource,
+    required this.rejectedPrognosis,
+  });
+
+  final DateTime scheduledLocal;
+  final DateTime etaLocal;
+  final int delaySeconds;
+  final int scheduledTimestamp;
+  final _FallbackPrognosisSource prognosisSource;
+  final bool rejectedPrognosis;
+
+  int get quality => switch (prognosisSource) {
+    _FallbackPrognosisSource.arrival => 3,
+    _FallbackPrognosisSource.departureFallback => 2,
+    _FallbackPrognosisSource.scheduled => 1,
+  };
+}
+
+class _FallbackCandidateRecord {
+  const _FallbackCandidateRecord({
+    required this.candidate,
+    required this.timingQuality,
+  });
+
+  final TripCandidate candidate;
+  final int timingQuality;
+}
+
+class _FallbackDirectionHint {
+  const _FallbackDirectionHint({
+    required this.value,
+    required this.destinationFoundInPassList,
+    required this.passListDerivedValue,
+    required this.source,
+  });
+
+  final String value;
+  final bool destinationFoundInPassList;
+  final String passListDerivedValue;
+  final String source;
+}
+
+class _ResolvedFallbackDirection {
+  const _ResolvedFallbackDirection(this.value, this.source);
+
+  final String value;
+  final String source;
+}
 
 class TransportService {
   TransportService({
     this.trace,
     this.traceCandidates,
     this.upcomingWindowHoursProvider,
-  });
+    TransportHttpGet? httpGet,
+  }) : _httpGet = httpGet ?? http.get;
 
   final void Function(String message)? trace;
   final CandidateTracer? traceCandidates;
   final int Function()? upcomingWindowHoursProvider;
+  final TransportHttpGet _httpGet;
 
   static const Duration _gtfsRtMinInterval = Duration(seconds: 13);
   static const Duration _gtfsRtFeedCacheTtl = Duration(seconds: 20);
+  static const Duration _stopNameFailureRetryDelay = Duration(seconds: 30);
+  static const Duration _maxPlausibleEarlyPrognosis = Duration(hours: 1);
+  static const Duration _maxPlausiblePositiveDelay = Duration(hours: 24);
   static const int _maxPickerHorizonHours = 6;
 
   DateTime? _lastGtfsRtCallAt;
@@ -33,10 +97,15 @@ class TransportService {
 
   final Map<String, String> _stopNameCache = {};
   final Map<String, Future<void>> _stopNameInFlight = {};
+  final Map<String, DateTime> _stopNameFailureAt = {};
   final Map<String, String> _routeShortNameByRouteId = {};
 
   void _trace(String message) => trace?.call(message);
-  void _traceStageCandidates(String stage, List<TripCandidate> candidates, {int max = 6}) {
+  void _traceStageCandidates(
+    String stage,
+    List<TripCandidate> candidates, {
+    int max = 6,
+  }) {
     traceCandidates?.call(stage, candidates, max: max);
   }
 
@@ -61,15 +130,14 @@ class TransportService {
       }
 
       final uri = Uri.parse('https://api.opentransportdata.swiss/la/gtfs-rt');
-      http.Response res = await http
-          .get(
-            uri,
-            headers: {
-              'Authorization': 'Bearer $key',
-              'Accept': 'application/x-protobuf, application/octet-stream;q=0.9, */*;q=0.8',
-            },
-          )
-          .timeout(const Duration(seconds: 12));
+      http.Response res = await _httpGet(
+        uri,
+        headers: {
+          'Authorization': 'Bearer $key',
+          'Accept':
+              'application/x-protobuf, application/octet-stream;q=0.9, */*;q=0.8',
+        },
+      ).timeout(const Duration(seconds: 12));
 
       _lastGtfsRtCallAt = DateTime.now();
 
@@ -79,15 +147,14 @@ class TransportService {
         final wait = Duration(seconds: retrySeconds ?? 60);
         await Future.delayed(wait);
 
-        res = await http
-            .get(
-              uri,
-              headers: {
-                'Authorization': 'Bearer $key',
-                'Accept': 'application/x-protobuf, application/octet-stream;q=0.9, */*;q=0.8',
-              },
-            )
-            .timeout(const Duration(seconds: 12));
+        res = await _httpGet(
+          uri,
+          headers: {
+            'Authorization': 'Bearer $key',
+            'Accept':
+                'application/x-protobuf, application/octet-stream;q=0.9, */*;q=0.8',
+          },
+        ).timeout(const Duration(seconds: 12));
 
         _lastGtfsRtCallAt = DateTime.now();
       }
@@ -110,7 +177,9 @@ class TransportService {
 
     final res = await _getGtfsRtResponse();
     if (res.statusCode != 200) {
-      throw Exception('GTFS-RT HTTP ${res.statusCode} (${res.headers['content-type'] ?? 'unknown'})');
+      throw Exception(
+        'GTFS-RT HTTP ${res.statusCode} (${res.headers['content-type'] ?? 'unknown'})',
+      );
     }
 
     final feed = FeedMessage.fromBuffer(res.bodyBytes);
@@ -124,10 +193,40 @@ class TransportService {
       'https://transport.opendata.ch/v1/locations?query=${Uri.encodeComponent(query)}&type=station',
     );
 
-    final res = await http.get(uri).timeout(const Duration(seconds: 10));
-    if (res.statusCode != 200) return const [];
+    http.Response res;
+    try {
+      res = await _httpGet(uri).timeout(const Duration(seconds: 10));
+    } on TimeoutException {
+      _trace(
+        'Stop-id resolution failed query="$query" reason=timeout '
+        'timeoutSeconds=10',
+      );
+      return const [];
+    } catch (error) {
+      _trace(
+        'Stop-id resolution failed query="$query" '
+        'reason=network-exception type=${error.runtimeType}',
+      );
+      return const [];
+    }
+    if (res.statusCode != 200) {
+      _trace(
+        'Stop-id resolution failed query="$query" '
+        'reason=http-${res.statusCode}',
+      );
+      return const [];
+    }
 
-    final decoded = json.decode(utf8.decode(res.bodyBytes, allowMalformed: true));
+    dynamic decoded;
+    try {
+      decoded = json.decode(utf8.decode(res.bodyBytes, allowMalformed: true));
+    } catch (error) {
+      _trace(
+        'Stop-id resolution failed query="$query" '
+        'reason=malformed-json type=${error.runtimeType}',
+      );
+      return const [];
+    }
     if (decoded is! Map) return const [];
 
     final stations = decoded['stations'];
@@ -173,7 +272,9 @@ class TransportService {
   }
 
   String? normalizeStopId(String raw) {
-    final digits = RegExp(r'\d+').allMatches(raw).map((m) => m.group(0)!).join();
+    final digits = RegExp(
+      r'\d+',
+    ).allMatches(raw).map((m) => m.group(0)!).join();
     if (digits.isEmpty) return null;
 
     if (digits.length >= 7) {
@@ -190,9 +291,83 @@ class TransportService {
     return digits;
   }
 
+  static _FallbackTiming? _fallbackTimingFromStopMap(Map stopMap) {
+    int? asPositiveInt(dynamic value) {
+      final parsed = switch (value) {
+        int v => v,
+        num v => v.toInt(),
+        null => null,
+        _ => int.tryParse(value.toString()),
+      };
+      return parsed != null && parsed > 0 ? parsed : null;
+    }
+
+    DateTime? parseIsoFlexible(dynamic value) {
+      final raw = value?.toString().trim() ?? '';
+      if (raw.isEmpty) return null;
+      return DateTime.tryParse(raw)?.toLocal();
+    }
+
+    final schedArrivalTs = asPositiveInt(stopMap['arrivalTimestamp']);
+    final schedDepartureTs = asPositiveInt(stopMap['departureTimestamp']);
+    final usesScheduledArrival = schedArrivalTs != null;
+    final schedTs = schedArrivalTs ?? schedDepartureTs;
+    if (schedTs == null) return null;
+
+    final scheduledLocal = DateTime.fromMillisecondsSinceEpoch(
+      schedTs * 1000,
+      isUtc: true,
+    ).toLocal();
+    final prognosis = stopMap['prognosis'];
+    final prognosisMap = prognosis is Map ? prognosis : null;
+    final prognosisArrival = parseIsoFlexible(prognosisMap?['arrival']);
+    final prognosisDeparture = parseIsoFlexible(prognosisMap?['departure']);
+
+    var rejectedPrognosis = false;
+    DateTime? plausible(DateTime? value) {
+      if (value == null) return null;
+      final delta = value.difference(scheduledLocal);
+      if (delta < -_maxPlausibleEarlyPrognosis ||
+          delta > _maxPlausiblePositiveDelay) {
+        rejectedPrognosis = true;
+        return null;
+      }
+      return value;
+    }
+
+    final preferred = usesScheduledArrival
+        ? plausible(prognosisArrival)
+        : plausible(prognosisDeparture);
+    final fallback = usesScheduledArrival
+        ? plausible(prognosisDeparture)
+        : plausible(prognosisArrival);
+    final selected = preferred ?? fallback;
+    final source = selected == null
+        ? _FallbackPrognosisSource.scheduled
+        : (identical(selected, prognosisArrival)
+              ? _FallbackPrognosisSource.arrival
+              : _FallbackPrognosisSource.departureFallback);
+    final etaLocal = selected ?? scheduledLocal;
+
+    return _FallbackTiming(
+      scheduledLocal: scheduledLocal,
+      etaLocal: etaLocal,
+      delaySeconds: etaLocal.difference(scheduledLocal).inSeconds,
+      scheduledTimestamp: schedTs,
+      prognosisSource: source,
+      rejectedPrognosis: rejectedPrognosis,
+    );
+  }
+
   Future<void> ensureStopName(String canonStopId) async {
     if (canonStopId.isEmpty) return;
     if (_stopNameCache.containsKey(canonStopId)) return;
+
+    final lastFailure = _stopNameFailureAt[canonStopId];
+    if (lastFailure != null &&
+        DateTime.now().difference(lastFailure) < _stopNameFailureRetryDelay) {
+      return;
+    }
 
     if (_stopNameInFlight.containsKey(canonStopId)) {
       await _stopNameInFlight[canonStopId];
@@ -204,25 +379,29 @@ class TransportService {
         final id = MatchingService.toOpendataId(canonStopId);
 
         http.Response res;
-        final uri = Uri.parse('https://transport.opendata.ch/v1/locations?id=${Uri.encodeComponent(id)}');
-        res = await http.get(uri).timeout(const Duration(seconds: 8));
+        final uri = Uri.parse(
+          'https://transport.opendata.ch/v1/locations?id=${Uri.encodeComponent(id)}',
+        );
+        res = await _httpGet(uri).timeout(const Duration(seconds: 8));
 
         if (res.statusCode != 200) {
           final altUri = Uri.parse(
             'https://transport.opendata.ch/v1/locations?query=${Uri.encodeComponent(id)}&type=station',
           );
-          res = await http.get(altUri).timeout(const Duration(seconds: 8));
+          res = await _httpGet(altUri).timeout(const Duration(seconds: 8));
         }
 
         if (res.statusCode != 200) {
-          _stopNameCache[canonStopId] = 'Unknown';
+          _recordStopNameFailure(canonStopId, 'http-${res.statusCode}');
           return;
         }
 
-        final decoded = json.decode(utf8.decode(res.bodyBytes, allowMalformed: true));
+        final decoded = json.decode(
+          utf8.decode(res.bodyBytes, allowMalformed: true),
+        );
         final stations = (decoded is Map) ? decoded['stations'] : null;
         if (stations is! List || stations.isEmpty) {
-          _stopNameCache[canonStopId] = 'Unknown';
+          _recordStopNameFailure(canonStopId, 'empty-or-malformed-response');
           return;
         }
 
@@ -238,23 +417,42 @@ class TransportService {
         }
         best ??= stations.first is Map ? stations.first as Map : null;
         if (best == null) {
-          _stopNameCache[canonStopId] = 'Unknown';
+          _recordStopNameFailure(canonStopId, 'no-usable-station');
           return;
         }
 
-        final name = (best['name'] ?? '').toString();
-        _stopNameCache[canonStopId] = name.isNotEmpty ? name : 'Unknown';
-      } catch (_) {
-        _stopNameCache[canonStopId] = 'Unknown';
+        final name = (best['name'] ?? '').toString().trim();
+        if (name.isEmpty) {
+          _recordStopNameFailure(canonStopId, 'empty-name');
+          return;
+        }
+
+        _stopNameCache[canonStopId] = name;
+        _stopNameFailureAt.remove(canonStopId);
+      } catch (error) {
+        _recordStopNameFailure(canonStopId, 'exception=${error.runtimeType}');
       }
     }();
 
     _stopNameInFlight[canonStopId] = fut;
-    await fut;
-    _stopNameInFlight.remove(canonStopId);
+    try {
+      await fut;
+    } finally {
+      _stopNameInFlight.remove(canonStopId);
+    }
   }
 
-  Future<void> warmStopNamesForCandidates(List<TripCandidate> candidates) async {
+  void _recordStopNameFailure(String canonStopId, String reason) {
+    _stopNameFailureAt[canonStopId] = DateTime.now();
+    _trace(
+      'Stop-name resolution failed stopId=$canonStopId reason=$reason '
+      'retryAfterSeconds=${_stopNameFailureRetryDelay.inSeconds}',
+    );
+  }
+
+  Future<void> warmStopNamesForCandidates(
+    List<TripCandidate> candidates,
+  ) async {
     final ids = <String>{};
 
     for (final c in candidates) {
@@ -269,7 +467,25 @@ class TransportService {
     }
 
     if (ids.isEmpty) return;
-    await Future.wait(ids.map(ensureStopName));
+    await _ensureStopNamesBounded(ids);
+  }
+
+  Future<void> _ensureStopNamesBounded(
+    Iterable<String> ids, {
+    int maxConcurrent = 4,
+  }) async {
+    final pending = ids.toList();
+    for (var start = 0; start < pending.length; start += maxConcurrent) {
+      final end = (start + maxConcurrent).clamp(0, pending.length);
+      await Future.wait(pending.sublist(start, end).map(ensureStopName));
+    }
+  }
+
+  bool _canAttemptStopName(String canonStopId) {
+    if (_stopNameCache.containsKey(canonStopId)) return false;
+    final lastFailure = _stopNameFailureAt[canonStopId];
+    return lastFailure == null ||
+        DateTime.now().difference(lastFailure) >= _stopNameFailureRetryDelay;
   }
 
   String stopLabel(String rawStopId) {
@@ -280,7 +496,11 @@ class TransportService {
   }
 
   String terminalLabel(TripCandidate c) {
-    return MatchingService.terminalLabelFor(c, stopLabel: stopLabel, normalizeStopId: normalizeStopId);
+    return MatchingService.terminalLabelFor(
+      c,
+      stopLabel: stopLabel,
+      normalizeStopId: normalizeStopId,
+    );
   }
 
   bool stopIdMatches(String stopCanon, String destCanon) {
@@ -329,8 +549,16 @@ class TransportService {
       final tripShortNorm = _normalizeTrainToken(tripShortName);
       final routeShortNorm = _normalizeTrainToken(routeShortName);
 
-      final rawLabels = <String>[displayTrain, routeId, tripId, tripShortName, routeShortName];
-      final matchesTrain = tq.isEmpty || MatchingService.matchesTrainQueryTokenAware(trainQuery, rawLabels);
+      final rawLabels = <String>[
+        displayTrain,
+        routeId,
+        tripId,
+        tripShortName,
+        routeShortName,
+      ];
+      final matchesTrain =
+          tq.isEmpty ||
+          MatchingService.matchesTrainQueryTokenAware(trainQuery, rawLabels);
       if (!matchesTrain) {
         _trace(
           'GTFS-RT reject reason=train_query_mismatch tripId="$tripId" routeId="$routeId" '
@@ -357,15 +585,24 @@ class TransportService {
         if (stopCanon == null) continue;
 
         final arrivalTime = stu.hasArrival() ? stu.arrival.time.toInt() : 0;
-        final departureTime = stu.hasDeparture() ? stu.departure.time.toInt() : 0;
+        final departureTime = stu.hasDeparture()
+            ? stu.departure.time.toInt()
+            : 0;
         final etaSec = arrivalTime != 0 ? arrivalTime : departureTime;
         if (etaSec == 0) continue;
 
-        final etaLocal = DateTime.fromMillisecondsSinceEpoch(etaSec * 1000, isUtc: true).toLocal();
-        if (etaLocal.isBefore(now.subtract(const Duration(minutes: 2)))) continue;
+        final etaLocal = DateTime.fromMillisecondsSinceEpoch(
+          etaSec * 1000,
+          isUtc: true,
+        ).toLocal();
+        if (etaLocal.isBefore(now.subtract(const Duration(minutes: 2)))) {
+          continue;
+        }
 
         final arrivalDelay = stu.hasArrival() ? stu.arrival.delay.toInt() : 0;
-        final departureDelay = stu.hasDeparture() ? stu.departure.delay.toInt() : 0;
+        final departureDelay = stu.hasDeparture()
+            ? stu.departure.delay.toInt()
+            : 0;
         final delaySeconds = arrivalDelay != 0 ? arrivalDelay : departureDelay;
 
         final stop = StopEta(
@@ -387,7 +624,9 @@ class TransportService {
       upcoming.sort((a, b) => a.etaLocal.compareTo(b.etaLocal));
       var usedBaselMainFallback = false;
 
-      if (requireDestinationMatch && matchedDest == null && MatchingService.isBaselMainStationQuery(destCanon)) {
+      if (requireDestinationMatch &&
+          matchedDest == null &&
+          MatchingService.isBaselMainStationQuery(destCanon)) {
         StopEta? baselMain;
         for (final s in upcoming) {
           if (_isBaselMainStationStopHintViaService(s)) {
@@ -440,6 +679,7 @@ class TransportService {
         'GTFS-RT candidate found tripId=${candidate.tripId} routeId=${candidate.routeId} '
         'stopId=${candidate.stopId} etaLocal=${candidate.etaLocal.toIso8601String()} '
         'delaySeconds=${candidate.delaySeconds} terminal="${terminalLabel(candidate)}" '
+        'directionSource=last-available-gtfs-rt-stop '
         'baselMainFallbackUsed=$usedBaselMainFallback',
       );
     }
@@ -453,14 +693,30 @@ class TransportService {
     String trainQuery,
     String destName,
   ) async {
-    final trainOnly = findCandidates(feed, trainQuery, '0', requireDestinationMatch: false);
+    final trainOnly = findCandidates(
+      feed,
+      trainQuery,
+      '0',
+      requireDestinationMatch: false,
+    );
     if (trainOnly.isEmpty) return const <TripCandidate>[];
 
-    const maxCandidates = 8;
-    const maxStopsPerCandidate = 30;
+    const maxCandidates = 15;
+    const maxStopsPerCandidate = 40;
     const maxLookupsTotal = 25;
 
-    int lookups = 0;
+    final lookupIds = <String>{};
+    for (final c in trainOnly.take(maxCandidates)) {
+      for (final s in c.upcomingStops.take(maxStopsPerCandidate)) {
+        if (_canAttemptStopName(s.stopIdCanon)) {
+          lookupIds.add(s.stopIdCanon);
+        }
+        if (lookupIds.length >= maxLookupsTotal) break;
+      }
+      if (lookupIds.length >= maxLookupsTotal) break;
+    }
+    await _ensureStopNamesBounded(lookupIds);
+
     final out = <TripCandidate>[];
 
     for (final c in trainOnly.take(maxCandidates)) {
@@ -468,13 +724,8 @@ class TransportService {
 
       for (final s in c.upcomingStops.take(maxStopsPerCandidate)) {
         final canon = s.stopIdCanon;
-        if (!_stopNameCache.containsKey(canon) && lookups < maxLookupsTotal) {
-          lookups++;
-          await ensureStopName(canon);
-        }
-
         final name = _stopNameCache[canon];
-        if (name == null || name == 'Unknown') continue;
+        if (name == null) continue;
 
         if (MatchingService.stationNameMatchesQuery(name, destName)) {
           matched = s;
@@ -483,7 +734,6 @@ class TransportService {
       }
 
       if (matched != null) out.add(c.copyWithDestination(matched));
-      if (out.length >= 10) break;
     }
 
     out.sort((a, b) => a.etaLocal.compareTo(b.etaLocal));
@@ -495,10 +745,13 @@ class TransportService {
     required List<String> destStopIdCanons,
     String? destNameQuery,
     int limit = 100,
+    bool resolveDestinationName = true,
   }) async {
     final tq = _normalizeTrainToken(trainQuery);
     final hasTrainFilter = tq.isNotEmpty;
-    _trace('Destination-fallback start destinationQuery="${destNameQuery ?? ""}" trainQueryNorm="$tq" trainFilter=$hasTrainFilter');
+    _trace(
+      'Destination-fallback start destinationQuery="${destNameQuery ?? ""}" trainQueryNorm="$tq" trainFilter=$hasTrainFilter',
+    );
 
     final uniqueStops = <String>{};
     final maxStops = hasTrainFilter ? 4 : 16;
@@ -507,25 +760,26 @@ class TransportService {
       if (canon.isNotEmpty) uniqueStops.add(canon);
       if (uniqueStops.length >= maxStops) break;
     }
-    if (uniqueStops.isEmpty) return const <TripCandidate>[];
 
-    var orderedStops = uniqueStops.toList()..sort();
-
-    if (!hasTrainFilter && (destNameQuery ?? '').trim().isNotEmpty) {
+    if (resolveDestinationName && (destNameQuery ?? '').trim().isNotEmpty) {
       final extraResolved = await resolveStopIdsFromName(destNameQuery!);
       for (final raw in extraResolved) {
         final canon = normalizeStopId(raw) ?? raw;
         if (canon.isNotEmpty) uniqueStops.add(canon);
         if (uniqueStops.length >= maxStops) break;
       }
-      orderedStops = uniqueStops.toList()..sort();
     }
+    if (uniqueStops.isEmpty) return const <TripCandidate>[];
+
+    // A Set preserves the caller/resolver relevance order. Do not sort IDs:
+    // their numeric order has no relevance meaning.
+    final orderedStops = uniqueStops.toList();
     _trace(
       'Destination-fallback fetch destinationQuery="${destNameQuery ?? ""}" '
       'resolvedStopIds=[${orderedStops.join(",")}] limit=$limit',
     );
 
-    await Future.wait(orderedStops.map(ensureStopName));
+    await _ensureStopNamesBounded(orderedStops);
     final stopLabels = orderedStops.map((id) => stopLabel(id)).join(' | ');
     _trace('Destination-fallback stop names=$stopLabels');
 
@@ -541,10 +795,12 @@ class TransportService {
     }
 
     final queryNorm = normText(destNameQuery ?? '');
-    bool queryHasAny(List<String> toks) => toks.any((t) => queryNorm.contains(t));
+    bool queryHasAny(List<String> toks) =>
+        toks.any((t) => queryNorm.contains(t));
 
     String primaryDestCanon = orderedStops.first;
     double bestScore = -1e9;
+    final scoresByStop = <String, double>{};
     for (final canon in orderedStops) {
       final stopName = (_stopNameCache[canon] ?? '').trim();
       final stopNorm = normText(stopName);
@@ -560,7 +816,11 @@ class TransportService {
         }
       }
 
-      if (stopNorm.contains('bahnhof') || stopNorm.contains(' hb ') || stopNorm.endsWith(' hb') || stopNorm.contains(' sbb ')) {
+      if (stopNorm.contains('bahnhof') ||
+          stopNorm.contains(' hb ') ||
+          stopNorm.endsWith(' hb') ||
+          stopNorm.contains(' sbb ') ||
+          stopNorm.endsWith(' sbb')) {
         score += 8;
       }
 
@@ -576,46 +836,74 @@ class TransportService {
         if (!queryHasAny(group)) score -= 30;
       }
 
+      scoresByStop[canon] = score;
+
       if (score > bestScore) {
         bestScore = score;
         primaryDestCanon = canon;
       }
     }
 
-    final qualifierTokens = <String>['west', 'allmend', 'sud', 'sued', 'zentrum'];
-    final queryWantsQualifier = qualifierTokens.any((t) => queryNorm.contains(t));
+    final qualifierTokens = <String>[
+      'west',
+      'allmend',
+      'sud',
+      'sued',
+      'zentrum',
+    ];
+    final queryWantsQualifier = qualifierTokens.any(
+      (t) => queryNorm.contains(t),
+    );
 
-    final List<String> stopsToFetch = !hasTrainFilter
-        ? orderedStops
-        : (queryWantsQualifier ? orderedStops : <String>[primaryDestCanon]);
-    _trace('Destination-fallback fetch-expanded stopIds=${stopsToFetch.join(",")}');
+    final List<String> stopsToFetch;
+    if (!hasTrainFilter || queryWantsQualifier) {
+      stopsToFetch = orderedStops;
+    } else {
+      stopsToFetch = <String>[primaryDestCanon];
+      for (final canon in orderedStops) {
+        if (canon == primaryDestCanon) continue;
+        final isStrongNameMatch = (scoresByStop[canon] ?? 0) >= 45;
+        final primaryNameUnavailable = !_stopNameCache.containsKey(
+          primaryDestCanon,
+        );
+        if (isStrongNameMatch || primaryNameUnavailable) {
+          stopsToFetch.add(canon);
+        }
+        if (stopsToFetch.length >= 2) break;
+      }
+    }
+    _trace(
+      'Destination-fallback selected primaryStopId=$primaryDestCanon '
+      'primaryScore=$bestScore fetchStopIds=[${stopsToFetch.join(",")}]',
+    );
 
     final now = DateTime.now();
     final lowerBound = now.subtract(const Duration(seconds: 15));
     final windowEnd = now.add(const Duration(hours: _maxPickerHorizonHours));
-    _trace('Upcoming window active: ${upcomingWindowHoursProvider?.call() ?? 2}h');
+    _trace(
+      'Upcoming window active: ${upcomingWindowHoursProvider?.call() ?? 2}h',
+    );
     _trace('Upcoming window max horizon: ${_maxPickerHorizonHours}h');
     _trace(
       'Destination-fallback window lowerBound=${lowerBound.toIso8601String()} '
       'windowEnd=${windowEnd.toIso8601String()}',
     );
 
-    final destName = _stopNameCache[primaryDestCanon] ?? '';
-    final allByKey = <String, TripCandidate>{};
-    final filteredByKey = <String, TripCandidate>{};
+    final allByKey = <String, _FallbackCandidateRecord>{};
+    final filteredByKey = <String, _FallbackCandidateRecord>{};
 
-    bool mergeCandidate(Map<String, TripCandidate> map, String key, TripCandidate cand) {
+    bool mergeCandidate(
+      Map<String, _FallbackCandidateRecord> map,
+      String key,
+      _FallbackCandidateRecord record,
+    ) {
       final prev = map[key];
       if (prev == null) {
-        map[key] = cand;
+        map[key] = record;
         return true;
       }
-      if (prev.delaySeconds == 0 && cand.delaySeconds != 0) {
-        map[key] = cand;
-        return true;
-      }
-      if (cand.delaySeconds.abs() > prev.delaySeconds.abs()) {
-        map[key] = cand;
+      if (record.timingQuality > prev.timingQuality) {
+        map[key] = record;
         return true;
       }
       return false;
@@ -629,16 +917,54 @@ class TransportService {
 
       http.Response res;
       try {
-        res = await http.get(uri).timeout(const Duration(seconds: 10));
-      } catch (_) {
+        res = await _httpGet(uri).timeout(const Duration(seconds: 10));
+      } on TimeoutException {
+        _trace(
+          'Destination-fallback stationboard failed stopId=$destStopIdCanon '
+          'reason=timeout timeoutSeconds=10',
+        );
+        continue;
+      } catch (error) {
+        _trace(
+          'Destination-fallback stationboard failed stopId=$destStopIdCanon '
+          'reason=network-or-decode-exception type=${error.runtimeType}',
+        );
         continue;
       }
-      if (res.statusCode != 200) continue;
+      if (res.statusCode != 200) {
+        _trace(
+          'Destination-fallback stationboard failed stopId=$destStopIdCanon '
+          'reason=http-${res.statusCode}',
+        );
+        continue;
+      }
 
-      final decoded = json.decode(utf8.decode(res.bodyBytes, allowMalformed: true));
+      dynamic decoded;
+      try {
+        decoded = json.decode(utf8.decode(res.bodyBytes, allowMalformed: true));
+      } catch (error) {
+        _trace(
+          'Destination-fallback stationboard failed stopId=$destStopIdCanon '
+          'reason=malformed-json type=${error.runtimeType}',
+        );
+        continue;
+      }
       final list = (decoded is Map) ? decoded['stationboard'] : null;
-      if (list is! List || list.isEmpty) continue;
-      _trace('Destination-fallback raw fetch stopId=$destStopIdCanon count=${list.length}');
+      if (list is! List || list.isEmpty) {
+        _trace(
+          'Destination-fallback stationboard empty stopId=$destStopIdCanon '
+          'reason=${list is List ? "empty" : "malformed"}',
+        );
+        continue;
+      }
+
+      DateTime? earliestRawScheduled;
+      DateTime? latestRawScheduled;
+      var usableScheduledCount = 0;
+      var matchingTrainCount = 0;
+      var survivingEtaValidityCount = 0;
+      var survivingWindowCount = 0;
+      var rejectedPrognosisCount = 0;
 
       for (final item in list) {
         if (item is! Map) continue;
@@ -650,7 +976,8 @@ class TransportService {
 
         final normName = _normalizeTrainToken(name);
         final normCatNum = _normalizeTrainToken(catNum);
-        final matchesTrain = !hasTrainFilter ||
+        final matchesTrain =
+            !hasTrainFilter ||
             MatchingService.matchesTrainQuery(tq, normCatNum) ||
             MatchingService.matchesTrainQuery(tq, normName);
 
@@ -658,59 +985,32 @@ class TransportService {
         if (stop is! Map) continue;
 
         final Map stopMap = stop;
-        final Map? prog = (stopMap['prognosis'] is Map) ? stopMap['prognosis'] as Map : null;
+        final Map? prog = (stopMap['prognosis'] is Map)
+            ? stopMap['prognosis'] as Map
+            : null;
 
-        int? asInt(dynamic v) {
-          if (v == null) return null;
-          if (v is int) return v;
-          if (v is num) return v.toInt();
-          return int.tryParse(v.toString());
+        final timing = _fallbackTimingFromStopMap(stopMap);
+        if (timing == null) continue;
+        usableScheduledCount++;
+        if (earliestRawScheduled == null ||
+            timing.scheduledLocal.isBefore(earliestRawScheduled)) {
+          earliestRawScheduled = timing.scheduledLocal;
+        }
+        if (latestRawScheduled == null ||
+            timing.scheduledLocal.isAfter(latestRawScheduled)) {
+          latestRawScheduled = timing.scheduledLocal;
         }
 
-        DateTime? parseIsoFlexible(String? value) {
-          if (value == null) return null;
-          final s = value.trim();
-          if (s.isEmpty) return null;
-          try {
-            return DateTime.parse(s).toLocal();
-          } catch (_) {
-            return null;
-          }
+        if (!matchesTrain) continue;
+        matchingTrainCount++;
+        survivingEtaValidityCount++;
+        if (timing.rejectedPrognosis) rejectedPrognosisCount++;
+
+        final etaLocal = timing.etaLocal;
+        if (!etaLocal.isAfter(lowerBound) || etaLocal.isAfter(windowEnd)) {
+          continue;
         }
-
-        final schedArrivalTs = asInt(stopMap['arrivalTimestamp']);
-        final schedDepartureTs = asInt(stopMap['departureTimestamp']);
-        final int? schedTs = schedArrivalTs ?? schedDepartureTs;
-        if (schedTs == null || schedTs <= 0) continue;
-        final schedLocal = DateTime.fromMillisecondsSinceEpoch(schedTs * 1000, isUtc: true).toLocal();
-
-        final String? progArrivalIso = prog == null ? null : prog['arrival']?.toString();
-        final String? progDepartureIso = prog == null ? null : prog['departure']?.toString();
-
-        final DateTime? progArrivalLocal = parseIsoFlexible(progArrivalIso);
-        final DateTime? progDepartureLocal = parseIsoFlexible(progDepartureIso);
-
-        DateTime? bestProg;
-        int bestAbs = 1 << 30;
-
-        void consider(DateTime? dt) {
-          if (dt == null) return;
-          final abs = (dt.difference(schedLocal).inSeconds).abs();
-          if (abs > 6 * 60 * 60) return;
-          if (abs < bestAbs) {
-            bestAbs = abs;
-            bestProg = dt;
-          }
-        }
-
-        consider(progArrivalLocal);
-        consider(progDepartureLocal);
-
-        final etaLocal = bestProg ?? schedLocal;
-        if (!etaLocal.isAfter(lowerBound) || etaLocal.isAfter(windowEnd)) continue;
-
-        final delaySeconds = etaLocal.difference(schedLocal).inSeconds;
-        final effectiveTs = etaLocal.toUtc().millisecondsSinceEpoch ~/ 1000;
+        survivingWindowCount++;
 
         final displayLine = catNum.isNotEmpty ? catNum : name;
         final lineTrim = displayLine.trim();
@@ -723,57 +1023,92 @@ class TransportService {
           display = nameTrim.isNotEmpty ? nameTrim : 'Train';
         }
 
-        final derivedTerminalRaw = _deriveTerminalNameFromArrivalItem(item, destStopIdCanon).trim();
+        final directionHint = _deriveDirectionHintFromArrivalItem(
+          item,
+          destStopIdCanon,
+        );
+        final derivedTerminalRaw = directionHint.value.trim();
         final toRaw = (item['to'] ?? '').toString().trim();
+        final sourceDestName = _stopNameCache[destStopIdCanon] ?? '';
 
-        final terminalName = await _resolveFallbackTerminalLabel(
+        final resolvedDirection = await _resolveFallbackTerminalLabel(
           derivedTerminalRaw: derivedTerminalRaw,
           toRaw: toRaw,
-          destName: destName,
+          destName: sourceDestName,
         );
+        final terminalName = resolvedDirection.value;
 
         final terminalKey = MatchingService.normalizeStationToken(terminalName);
         final platform = prog?['platform'] ?? stopMap['platform'];
         final platformKey = (platform ?? '').toString().trim().toLowerCase();
 
-        final lineKey = lineTrim.isNotEmpty ? _normalizeTrainToken(lineTrim) : _normalizeTrainToken(display);
-        final key = '$effectiveTs|$lineKey|$terminalKey|$platformKey';
-
-        final fallbackTripId = <String>[lineKey, effectiveTs.toString(), terminalKey, platformKey].join('_');
+        final lineKey = lineTrim.isNotEmpty
+            ? _normalizeTrainToken(lineTrim)
+            : _normalizeTrainToken(display);
+        final publicDirectionKey = MatchingService.normalizeStationToken(toRaw);
+        final key = '${timing.scheduledTimestamp}|$lineKey|$publicDirectionKey';
+        final fallbackTripId = 'fallback_$key';
 
         final cand = TripCandidate(
           tripId: fallbackTripId,
           routeId: lineTrim,
           startDate: '',
           startTime: '',
-          stopId: primaryDestCanon,
+          stopId: destStopIdCanon,
           etaLocal: etaLocal,
-          delaySeconds: delaySeconds,
+          delaySeconds: timing.delaySeconds,
           displayTrain: display,
           vehicleLabel: MatchingService.vehicleLabelFromDisplay(display),
           destinationMatched: true,
           upcomingStops: const <StopEta>[],
-          terminalStopId: terminalName.isNotEmpty ? terminalName : (item['to'] ?? '').toString(),
+          terminalStopId: terminalName.isNotEmpty
+              ? terminalName
+              : (item['to'] ?? '').toString(),
           terminalStopIdCanon: '',
         );
 
-        final storedAll = mergeCandidate(allByKey, key, cand);
-        final storedFiltered = matchesTrain ? mergeCandidate(filteredByKey, key, cand) : false;
+        final record = _FallbackCandidateRecord(
+          candidate: cand,
+          timingQuality: timing.quality,
+        );
+        final storedAll = mergeCandidate(allByKey, key, record);
+        final storedFiltered = matchesTrain
+            ? mergeCandidate(filteredByKey, key, record)
+            : false;
 
-        if ((hasTrainFilter && storedFiltered) || (!hasTrainFilter && storedAll)) {
+        if ((hasTrainFilter && storedFiltered) ||
+            (!hasTrainFilter && storedAll)) {
           final terminalRendered = terminalLabel(cand);
           _trace(
             'Fallback arrival candidate found tripId=${cand.tripId} displayTrain="${cand.displayTrain}" '
             'stopId=${cand.stopId} etaLocal=${cand.etaLocal.toIso8601String()} delaySeconds=${cand.delaySeconds} '
             'terminalRaw="$derivedTerminalRaw" terminalNorm="$terminalKey" platform="$platformKey" '
-            'terminalFinal="$terminalRendered"',
+            'terminalFinal="$terminalRendered" prognosisSource=${timing.prognosisSource.name} '
+            'scheduledLocal=${timing.scheduledLocal.toIso8601String()} '
+            'directionTo="$toRaw" passListDestinationFound=${directionHint.destinationFoundInPassList} '
+            'passListDerived="${directionHint.passListDerivedValue}" '
+            'directionDerivedSource=${directionHint.source} '
+            'directionFinalSource=${resolvedDirection.source}',
           );
         }
       }
+
+      _trace(
+        'Destination-fallback raw coverage stopId=$destStopIdCanon rawCount=${list.length} '
+        'usableScheduled=$usableScheduledCount '
+        'earliestScheduled=${earliestRawScheduled?.toIso8601String() ?? "none"} '
+        'latestScheduled=${latestRawScheduled?.toIso8601String() ?? "none"} '
+        'matchingTrainBeforeEta=$matchingTrainCount '
+        'survivingEtaValidity=$survivingEtaValidityCount '
+        'rejectedPrognosis=$rejectedPrognosisCount '
+        'survivingSixHourWindow=$survivingWindowCount',
+      );
     }
 
-    final all = allByKey.values.toList();
-    final filtered = filteredByKey.values.toList();
+    final all = allByKey.values.map((record) => record.candidate).toList();
+    final filtered = filteredByKey.values
+        .map((record) => record.candidate)
+        .toList();
     final out = hasTrainFilter ? filtered : all;
     out.sort((a, b) => a.etaLocal.compareTo(b.etaLocal));
 
@@ -783,9 +1118,15 @@ class TransportService {
         'minEta=${out.first.etaLocal.toIso8601String()} maxEta=${out.last.etaLocal.toIso8601String()}',
       );
     } else {
-      _trace('Destination-fallback merged broad count=0 trainFilter=$hasTrainFilter minEta=none maxEta=none');
+      _trace(
+        'Destination-fallback merged broad count=0 trainFilter=$hasTrainFilter minEta=none maxEta=none',
+      );
     }
-    _traceStageCandidates('Destination-fallback merged sample trainFilter=$hasTrainFilter', out, max: 8);
+    _traceStageCandidates(
+      'Destination-fallback merged sample trainFilter=$hasTrainFilter',
+      out,
+      max: 8,
+    );
 
     return out.take(limit).toList();
   }
@@ -804,7 +1145,8 @@ class TransportService {
         final trip = tu.trip;
 
         final tripIdMatch = trip.tripId.isNotEmpty && trip.tripId == c.tripId;
-        final keyMatch = (!tripIdMatch) &&
+        final keyMatch =
+            (!tripIdMatch) &&
             trip.routeId == c.routeId &&
             (c.startDate.isEmpty || trip.startDate == c.startDate) &&
             (c.startTime.isEmpty || trip.startTime == c.startTime);
@@ -822,16 +1164,27 @@ class TransportService {
           if (stopCanon == null) continue;
 
           final arrivalTime = stu.hasArrival() ? stu.arrival.time.toInt() : 0;
-          final departureTime = stu.hasDeparture() ? stu.departure.time.toInt() : 0;
+          final departureTime = stu.hasDeparture()
+              ? stu.departure.time.toInt()
+              : 0;
           final etaSec = arrivalTime != 0 ? arrivalTime : departureTime;
           if (etaSec == 0) continue;
 
-          final etaLocal = DateTime.fromMillisecondsSinceEpoch(etaSec * 1000, isUtc: true).toLocal();
-          if (etaLocal.isBefore(now.subtract(const Duration(minutes: 2)))) continue;
+          final etaLocal = DateTime.fromMillisecondsSinceEpoch(
+            etaSec * 1000,
+            isUtc: true,
+          ).toLocal();
+          if (etaLocal.isBefore(now.subtract(const Duration(minutes: 2)))) {
+            continue;
+          }
 
           final arrivalDelay = stu.hasArrival() ? stu.arrival.delay.toInt() : 0;
-          final departureDelay = stu.hasDeparture() ? stu.departure.delay.toInt() : 0;
-          final delaySeconds = arrivalDelay != 0 ? arrivalDelay : departureDelay;
+          final departureDelay = stu.hasDeparture()
+              ? stu.departure.delay.toInt()
+              : 0;
+          final delaySeconds = arrivalDelay != 0
+              ? arrivalDelay
+              : departureDelay;
 
           final stop = StopEta(
             stopIdRaw: stopIdRaw,
@@ -841,7 +1194,9 @@ class TransportService {
           );
 
           upcoming.add(stop);
-          if (stopIdMatches(stopCanon, destCanon) && matched == null) matched = stop;
+          if (stopIdMatches(stopCanon, destCanon) && matched == null) {
+            matched = stop;
+          }
         }
 
         if (upcoming.isEmpty) return null;
@@ -878,10 +1233,21 @@ class TransportService {
     if (arrivals.isEmpty) return null;
 
     final pool = arrivals
-        .where((x) => MatchingService.matchesTrainQuery(_normalizeTrainToken(c.displayTrain), _normalizeTrainToken(x.displayTrain)))
+        .where(
+          (x) => MatchingService.matchesTrainQuery(
+            _normalizeTrainToken(c.displayTrain),
+            _normalizeTrainToken(x.displayTrain),
+          ),
+        )
         .toList();
 
-    if (pool.isEmpty) return arrivals.first;
+    if (pool.isEmpty) {
+      _trace(
+        'Fallback refresh rejected reason=no-matching-line '
+        'requestedDisplayTrain="${c.displayTrain}" arrivals=${arrivals.length}',
+      );
+      return null;
+    }
 
     TripCandidate best = pool.first;
     int bestAbs = best.etaLocal.difference(c.etaLocal).inSeconds.abs();
@@ -897,12 +1263,17 @@ class TransportService {
     return best;
   }
 
-  String _deriveTerminalNameFromArrivalItem(Map item, String destStopCanon) {
+  _FallbackDirectionHint _deriveDirectionHintFromArrivalItem(
+    Map item,
+    String destStopCanon,
+  ) {
     final to = (item['to'] ?? '').toString().trim();
     final passList = item['passList'];
     final stop = item['stop'];
     final destStation = stop is Map ? stop['station'] : null;
-    final destName = (destStation is Map ? destStation['name'] : '').toString().trim();
+    final destName = (destStation is Map ? destStation['name'] : '')
+        .toString()
+        .trim();
 
     if (passList is List && passList.isNotEmpty) {
       String? nameAfterDest;
@@ -932,20 +1303,59 @@ class TransportService {
       }
 
       if (nameAfterDest != null) {
-        if (kDebugMode) {
-          debugPrint('[Treep][Arrivals] Terminal via passList: $nameAfterDest for $destStopCanon');
-        }
-        return nameAfterDest;
+        return _FallbackDirectionHint(
+          value: nameAfterDest,
+          destinationFoundInPassList: true,
+          passListDerivedValue: nameAfterDest,
+          source: 'pass-list-next-stop',
+        );
       }
 
-      if (!destSeen && fallbackLastName != null && fallbackLastName.isNotEmpty) return fallbackLastName;
+      if (!destSeen &&
+          fallbackLastName != null &&
+          fallbackLastName.isNotEmpty) {
+        return _FallbackDirectionHint(
+          value: fallbackLastName,
+          destinationFoundInPassList: false,
+          passListDerivedValue: fallbackLastName,
+          source: 'pass-list-last-visible',
+        );
+      }
+
+      if (to.isNotEmpty && to.toLowerCase() != destName.toLowerCase()) {
+        return _FallbackDirectionHint(
+          value: to,
+          destinationFoundInPassList: destSeen,
+          passListDerivedValue: '',
+          source: 'item-to',
+        );
+      }
+
+      return _FallbackDirectionHint(
+        value: destName,
+        destinationFoundInPassList: destSeen,
+        passListDerivedValue: '',
+        source: 'destination-name',
+      );
     }
 
-    if (to.isNotEmpty && to.toLowerCase() != destName.toLowerCase()) return to;
-    return destName;
+    if (to.isNotEmpty && to.toLowerCase() != destName.toLowerCase()) {
+      return _FallbackDirectionHint(
+        value: to,
+        destinationFoundInPassList: false,
+        passListDerivedValue: '',
+        source: 'item-to',
+      );
+    }
+    return _FallbackDirectionHint(
+      value: destName,
+      destinationFoundInPassList: false,
+      passListDerivedValue: '',
+      source: 'destination-name',
+    );
   }
 
-  Future<String> _resolveFallbackTerminalLabel({
+  Future<_ResolvedFallbackDirection> _resolveFallbackTerminalLabel({
     required String derivedTerminalRaw,
     required String toRaw,
     required String destName,
@@ -954,8 +1364,13 @@ class TransportService {
     final to = toRaw.trim();
     final dest = destName.trim();
 
-    if (terminalName.isNotEmpty && !_looksInternalStopTokenViaService(terminalName)) return terminalName;
-    if (to.isNotEmpty && !_looksInternalStopTokenViaService(to)) return to;
+    if (terminalName.isNotEmpty &&
+        !_looksInternalStopTokenViaService(terminalName)) {
+      return _ResolvedFallbackDirection(terminalName, 'derived-readable');
+    }
+    if (to.isNotEmpty && !_looksInternalStopTokenViaService(to)) {
+      return _ResolvedFallbackDirection(to, 'item-to-readable');
+    }
 
     final lookupRaw = terminalName.isNotEmpty ? terminalName : to;
     if (lookupRaw.isNotEmpty) {
@@ -963,17 +1378,29 @@ class TransportService {
       if (canon != null) {
         await ensureStopName(canon);
         final cached = (_stopNameCache[canon] ?? '').trim();
-        if (cached.isNotEmpty && cached != 'Unknown') return cached;
+        if (cached.isNotEmpty) {
+          return _ResolvedFallbackDirection(cached, 'stop-name-lookup');
+        }
       }
     }
 
-    if (dest.isNotEmpty) return dest;
-    if (terminalName.isNotEmpty) return terminalName;
-    return to;
+    if (dest.isNotEmpty) {
+      return _ResolvedFallbackDirection(dest, 'destination-name-fallback');
+    }
+    if (terminalName.isNotEmpty) {
+      return _ResolvedFallbackDirection(
+        terminalName,
+        'derived-unresolved-fallback',
+      );
+    }
+    return _ResolvedFallbackDirection(to, 'item-to-unresolved-fallback');
   }
 
   bool _looksInternalStopTokenViaService(String value) {
-    return MatchingService.looksInternalStopToken(value, normalizeStopId: normalizeStopId);
+    return MatchingService.looksInternalStopToken(
+      value,
+      normalizeStopId: normalizeStopId,
+    );
   }
 
   String _tripShortNameFromTripDescriptor(dynamic tripDescriptor) {
