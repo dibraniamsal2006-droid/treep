@@ -7,11 +7,37 @@ import 'package:http/http.dart' as http;
 
 import '../models/trip_candidate.dart';
 import 'matching_service.dart';
+import 'ojp_public_direction_service.dart';
 
 typedef CandidateTracer =
     void Function(String stage, List<TripCandidate> candidates, {int max});
 typedef TransportHttpGet =
     Future<http.Response> Function(Uri uri, {Map<String, String>? headers});
+
+String extractSwissOriginalTripId(TripDescriptor trip) {
+  final values = trip.unknownFields.getField(8)?.lengthDelimited;
+  if (values == null || values.length != 1) return '';
+  try {
+    return utf8.decode(values.single).trim();
+  } on FormatException {
+    return '';
+  }
+}
+
+String? swissStopPointRefFromGtfsStopId(String raw) {
+  final trimmed = raw.trim();
+  if (trimmed.startsWith('ch:1:sloid:')) {
+    return trimmed.split('::').first;
+  }
+
+  final digits = RegExp(
+    r'\d+',
+  ).allMatches(trimmed).map((match) => match.group(0)!).join();
+  if (digits.length != 7 || !digits.startsWith('85')) return null;
+  final didok = int.tryParse(digits.substring(2));
+  if (didok == null) return null;
+  return 'ch:1:sloid:$didok';
+}
 
 enum _FallbackPrognosisSource { scheduled, arrival, departureFallback }
 
@@ -76,12 +102,18 @@ class TransportService {
     this.traceCandidates,
     this.upcomingWindowHoursProvider,
     TransportHttpGet? httpGet,
-  }) : _httpGet = httpGet ?? http.get;
+    OjpPublicDirectionClient? ojpClient,
+    String? Function()? ojpApiKeyProvider,
+  }) : _httpGet = httpGet ?? http.get,
+       _ojpClient = ojpClient ?? OjpStopEventClient(),
+       _ojpApiKeyProvider = ojpApiKeyProvider ?? _defaultOjpApiKey;
 
   final void Function(String message)? trace;
   final CandidateTracer? traceCandidates;
   final int Function()? upcomingWindowHoursProvider;
   final TransportHttpGet _httpGet;
+  final OjpPublicDirectionClient _ojpClient;
+  final String? Function() _ojpApiKeyProvider;
 
   static const Duration _gtfsRtMinInterval = Duration(seconds: 13);
   static const Duration _gtfsRtFeedCacheTtl = Duration(seconds: 20);
@@ -101,6 +133,15 @@ class TransportService {
   final Map<String, String> _routeShortNameByRouteId = {};
 
   void _trace(String message) => trace?.call(message);
+
+  static String? _defaultOjpApiKey() {
+    try {
+      return dotenv.env['OJP_API_KEY'];
+    } catch (_) {
+      return null;
+    }
+  }
+
   void _traceStageCandidates(
     String stage,
     List<TripCandidate> candidates, {
@@ -537,6 +578,22 @@ class TransportService {
       final tu = e.tripUpdate;
       final trip = tu.trip;
 
+      final relationship = trip.scheduleRelationship;
+      if (relationship == TripDescriptor_ScheduleRelationship.CANCELED ||
+          relationship == TripDescriptor_ScheduleRelationship.DELETED) {
+        _trace(
+          'GTFS-RT reject reason=schedule-relationship-${relationship.name.toLowerCase()} '
+          'tripId="${trip.tripId}"',
+        );
+        continue;
+      }
+      final isScheduled =
+          !trip.hasScheduleRelationship() ||
+          relationship == TripDescriptor_ScheduleRelationship.SCHEDULED;
+      final originalTripId = isScheduled
+          ? extractSwissOriginalTripId(trip)
+          : '';
+
       final tripId = trip.tripId;
       final routeId = trip.routeId;
       final tripShortName = _tripShortNameFromTripDescriptor(trip);
@@ -661,6 +718,7 @@ class TransportService {
 
       final candidate = TripCandidate(
         tripId: tripId,
+        originalTripId: originalTripId,
         routeId: routeId,
         startDate: trip.startDate,
         startTime: trip.startTime,
@@ -795,23 +853,33 @@ class TransportService {
     }
 
     final queryNorm = normText(destNameQuery ?? '');
-    bool queryHasAny(List<String> toks) =>
-        toks.any((t) => queryNorm.contains(t));
+    final queryTokens = queryNorm
+        .split(' ')
+        .where((token) => token.isNotEmpty)
+        .toSet();
+    bool queryHasAny(List<String> toks) => toks.any(queryTokens.contains);
+
+    // Bahnhof/HB/SBB express main-station intent, not a local sub-stop.
+    // Ignore those aliases while ranking resolved stop names so an exact
+    // "Oensingen, Bahnhof" bus-stop label does not outrank "Oensingen".
+    const mainStationAliases = <String>{'bahnhof', 'hb', 'sbb'};
+    final rankingQueryNorm = queryTokens
+        .where((token) => !mainStationAliases.contains(token))
+        .join(' ');
 
     String primaryDestCanon = orderedStops.first;
     double bestScore = -1e9;
-    final scoresByStop = <String, double>{};
     for (final canon in orderedStops) {
       final stopName = (_stopNameCache[canon] ?? '').trim();
       final stopNorm = normText(stopName);
       double score = 0;
 
-      if (queryNorm.isNotEmpty) {
-        if (stopNorm == queryNorm) {
+      if (rankingQueryNorm.isNotEmpty) {
+        if (stopNorm == rankingQueryNorm) {
           score += 120;
-        } else if (stopNorm.startsWith(queryNorm)) {
+        } else if (stopNorm.startsWith(rankingQueryNorm)) {
           score += 70;
-        } else if (stopNorm.contains(queryNorm)) {
+        } else if (stopNorm.contains(rankingQueryNorm)) {
           score += 45;
         }
       }
@@ -826,6 +894,8 @@ class TransportService {
 
       final qualifierGroups = <List<String>>[
         <String>['west'],
+        <String>['ost'],
+        <String>['nord'],
         <String>['allmend'],
         <String>['sud', 'sued'],
         <String>['zentrum'],
@@ -836,8 +906,6 @@ class TransportService {
         if (!queryHasAny(group)) score -= 30;
       }
 
-      scoresByStop[canon] = score;
-
       if (score > bestScore) {
         bestScore = score;
         primaryDestCanon = canon;
@@ -846,30 +914,23 @@ class TransportService {
 
     final qualifierTokens = <String>[
       'west',
+      'ost',
+      'nord',
       'allmend',
       'sud',
       'sued',
       'zentrum',
     ];
-    final queryWantsQualifier = qualifierTokens.any(
-      (t) => queryNorm.contains(t),
-    );
+    final queryWantsQualifier = qualifierTokens.any(queryTokens.contains);
 
     final List<String> stopsToFetch;
-    if (!hasTrainFilter || queryWantsQualifier) {
+    if (queryWantsQualifier) {
       stopsToFetch = orderedStops;
     } else {
       stopsToFetch = <String>[primaryDestCanon];
       for (final canon in orderedStops) {
         if (canon == primaryDestCanon) continue;
-        final isStrongNameMatch = (scoresByStop[canon] ?? 0) >= 45;
-        final primaryNameUnavailable = !_stopNameCache.containsKey(
-          primaryDestCanon,
-        );
-        if (isStrongNameMatch || primaryNameUnavailable) {
-          stopsToFetch.add(canon);
-        }
-        if (stopsToFetch.length >= 2) break;
+        stopsToFetch.add(canon);
       }
     }
     _trace(
@@ -909,7 +970,23 @@ class TransportService {
       return false;
     }
 
-    for (final destStopIdCanon in stopsToFetch) {
+    for (var stopIndex = 0; stopIndex < stopsToFetch.length; stopIndex++) {
+      final destStopIdCanon = stopsToFetch[stopIndex];
+      if (!queryWantsQualifier && stopIndex > 0) {
+        if (stopIndex == 1) {
+          _trace(
+            'Destination-fallback primary empty; recovery alternatives attempted '
+            'primaryStopId=$primaryDestCanon',
+          );
+        }
+        _trace(
+          'Destination-fallback recovery attempt stopId=$destStopIdCanon '
+          'index=$stopIndex',
+        );
+      }
+      final outputCountBefore = hasTrainFilter
+          ? filteredByKey.length
+          : allByKey.length;
       final stationId = MatchingService.toOpendataId(destStopIdCanon);
       final uri = Uri.parse(
         'https://transport.opendata.ch/v1/stationboard?id=${Uri.encodeComponent(stationId)}&type=arrival&limit=$limit',
@@ -1065,6 +1142,7 @@ class TransportService {
               ? terminalName
               : (item['to'] ?? '').toString(),
           terminalStopIdCanon: '',
+          directionSource: DirectionSource.stationboard,
         );
 
         final record = _FallbackCandidateRecord(
@@ -1103,6 +1181,25 @@ class TransportService {
         'rejectedPrognosis=$rejectedPrognosisCount '
         'survivingSixHourWindow=$survivingWindowCount',
       );
+
+      final outputCountAfter = hasTrainFilter
+          ? filteredByKey.length
+          : allByKey.length;
+      final producedUsableOutput = outputCountAfter > outputCountBefore;
+      if (!queryWantsQualifier && producedUsableOutput) {
+        if (stopIndex == 0) {
+          _trace(
+            'Destination-fallback primary satisfied; alternatives skipped '
+            'primaryStopId=$primaryDestCanon outputCount=$outputCountAfter',
+          );
+        } else {
+          _trace(
+            'Destination-fallback recovery alternative succeeded '
+            'stopId=$destStopIdCanon outputCount=$outputCountAfter',
+          );
+        }
+        break;
+      }
     }
 
     final all = allByKey.values.map((record) => record.candidate).toList();
@@ -1206,6 +1303,7 @@ class TransportService {
 
         return TripCandidate(
           tripId: c.tripId,
+          originalTripId: c.originalTripId,
           routeId: c.routeId,
           startDate: c.startDate,
           startTime: c.startTime,
@@ -1216,8 +1314,17 @@ class TransportService {
           vehicleLabel: c.vehicleLabel,
           destinationMatched: matched != null,
           upcomingStops: upcoming.take(40).toList(),
-          terminalStopId: terminal.stopIdRaw,
-          terminalStopIdCanon: terminal.stopIdCanon,
+          terminalStopId:
+              c.directionSource.confidence >
+                  DirectionSource.gtfsRealtimeLastStop.confidence
+              ? c.terminalStopId
+              : terminal.stopIdRaw,
+          terminalStopIdCanon:
+              c.directionSource.confidence >
+                  DirectionSource.gtfsRealtimeLastStop.confidence
+              ? c.terminalStopIdCanon
+              : terminal.stopIdCanon,
+          directionSource: c.directionSource,
         );
       }
     }
@@ -1260,7 +1367,129 @@ class TransportService {
       }
     }
 
+    if (c.directionSource.confidence > best.directionSource.confidence) {
+      return best.withPublicDirection(
+        direction: c.publicDirection,
+        source: c.directionSource,
+      );
+    }
     return best;
+  }
+
+  Future<List<TripCandidate>> enrichPublicDirections(
+    List<TripCandidate> candidates,
+  ) async {
+    if (candidates.isEmpty) return candidates;
+
+    final eligible = candidates
+        .where(
+          (candidate) =>
+              candidate.originalTripId.startsWith('ch:1:sjyid:') &&
+              _canonicalOperatingDay(candidate.startDate) != null &&
+              candidate.destinationMatched,
+        )
+        .toList();
+    if (eligible.isEmpty) {
+      _trace('OJP direction skipped reason=no-eligible-candidate');
+      return candidates;
+    }
+
+    final apiKey = _ojpApiKeyProvider()?.trim() ?? '';
+    if (apiKey.isEmpty || apiKey == 'YOUR_API_KEY') {
+      _trace('OJP direction skipped reason=missing-api-key');
+      return candidates;
+    }
+
+    final stopPointRef = swissStopPointRefFromGtfsStopId(eligible.first.stopId);
+    if (stopPointRef == null) {
+      _trace('OJP direction skipped reason=unsupported-stop-id');
+      return candidates;
+    }
+
+    final sameStop = eligible
+        .where(
+          (candidate) =>
+              swissStopPointRefFromGtfsStopId(candidate.stopId) == stopPointRef,
+        )
+        .toList();
+    if (sameStop.isEmpty) return candidates;
+
+    final earliest = sameStop
+        .map((candidate) => candidate.etaLocal)
+        .reduce((a, b) => a.isBefore(b) ? a : b)
+        .subtract(const Duration(minutes: 10));
+
+    List<OjpStopEventRecord> records;
+    try {
+      _trace(
+        'OJP direction request stop=$stopPointRef candidates=${sameStop.length}',
+      );
+      records = await _ojpClient.fetchStopEvents(
+        apiKey: apiKey,
+        stopPointRef: stopPointRef,
+        from: earliest,
+        numberOfResults: 200,
+      );
+    } on TimeoutException {
+      _trace('OJP direction failed reason=timeout');
+      return candidates;
+    } catch (error) {
+      _trace('OJP direction failed reason=${error.runtimeType}');
+      return candidates;
+    }
+
+    final recordsByKey = <String, List<OjpStopEventRecord>>{};
+    for (final record in records) {
+      final day = _canonicalOperatingDay(record.operatingDayRef);
+      if (day == null || record.journeyRef.isEmpty) continue;
+      final key = '${record.journeyRef}|$day';
+      recordsByKey.putIfAbsent(key, () => []).add(record);
+    }
+
+    var enrichedCount = 0;
+    var ambiguousCount = 0;
+    final output = <TripCandidate>[];
+    for (final candidate in candidates) {
+      if (swissStopPointRefFromGtfsStopId(candidate.stopId) != stopPointRef) {
+        output.add(candidate);
+        continue;
+      }
+      final day = _canonicalOperatingDay(candidate.startDate);
+      if (day == null || candidate.originalTripId.isEmpty) {
+        output.add(candidate);
+        continue;
+      }
+
+      final matches = recordsByKey['${candidate.originalTripId}|$day'];
+      if (matches == null || matches.isEmpty) {
+        output.add(candidate);
+        continue;
+      }
+      if (matches.length != 1) {
+        ambiguousCount++;
+        output.add(candidate);
+        continue;
+      }
+
+      final publicDirection = matches.single.destinationText.trim();
+      if (publicDirection.isEmpty) {
+        output.add(candidate);
+        continue;
+      }
+
+      final enriched = candidate.withPublicDirection(
+        direction: publicDirection,
+        source: DirectionSource.ojpStopEvent,
+      );
+      if (!identical(enriched, candidate)) enrichedCount++;
+      output.add(enriched);
+    }
+
+    _trace(
+      'OJP direction completed records=${records.length} enriched=$enrichedCount '
+      'ambiguous=$ambiguousCount',
+    );
+    return output;
   }
 
   _FallbackDirectionHint _deriveDirectionHintFromArrivalItem(
@@ -1423,6 +1652,15 @@ class TransportService {
       stopNameCache: _stopNameCache,
     );
   }
+}
+
+String? _canonicalOperatingDay(String raw) {
+  final trimmed = raw.trim();
+  if (RegExp(r'^\d{8}$').hasMatch(trimmed)) return trimmed;
+  if (RegExp(r'^\d{4}-\d{2}-\d{2}$').hasMatch(trimmed)) {
+    return trimmed.replaceAll('-', '');
+  }
+  return null;
 }
 
 String _normalizeTrainToken(String s) {

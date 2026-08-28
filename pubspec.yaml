@@ -16,6 +16,7 @@ dependencies:
   shared_preferences: ^2.2.3
   http: ^1.6.0
   gtfs_realtime_bindings: ^1.1.0
+  xml: ^6.6.1
 
   flutter_local_notifications: ^17.2.4
   timezone: ^0.9.4

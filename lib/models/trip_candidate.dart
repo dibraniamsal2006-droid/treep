@@ -12,8 +12,21 @@ class StopEta {
   });
 }
 
+enum DirectionSource {
+  gtfsRealtimeLastStop,
+  stationboard,
+  ojpStopEvent;
+
+  int get confidence => switch (this) {
+    gtfsRealtimeLastStop => 1,
+    stationboard => 2,
+    ojpStopEvent => 3,
+  };
+}
+
 class TripCandidate {
   final String tripId;
+  final String originalTripId;
   final String routeId;
   final String startDate;
   final String startTime;
@@ -26,9 +39,11 @@ class TripCandidate {
   final List<StopEta> upcomingStops;
   final String terminalStopId;
   final String terminalStopIdCanon;
+  final DirectionSource directionSource;
 
   TripCandidate({
     required this.tripId,
+    this.originalTripId = '',
     required this.routeId,
     required this.startDate,
     required this.startTime,
@@ -41,23 +56,69 @@ class TripCandidate {
     required this.upcomingStops,
     required this.terminalStopId,
     required this.terminalStopIdCanon,
+    this.directionSource = DirectionSource.gtfsRealtimeLastStop,
   });
 
-  TripCandidate copyWithDestination(StopEta stop) {
+  String get publicDirection => terminalStopId;
+
+  TripCandidate copyWith({
+    String? tripId,
+    String? originalTripId,
+    String? routeId,
+    String? startDate,
+    String? startTime,
+    String? stopId,
+    DateTime? etaLocal,
+    int? delaySeconds,
+    String? displayTrain,
+    String? vehicleLabel,
+    bool? destinationMatched,
+    List<StopEta>? upcomingStops,
+    String? terminalStopId,
+    String? terminalStopIdCanon,
+    DirectionSource? directionSource,
+  }) {
     return TripCandidate(
-      tripId: tripId,
-      routeId: routeId,
-      startDate: startDate,
-      startTime: startTime,
+      tripId: tripId ?? this.tripId,
+      originalTripId: originalTripId ?? this.originalTripId,
+      routeId: routeId ?? this.routeId,
+      startDate: startDate ?? this.startDate,
+      startTime: startTime ?? this.startTime,
+      stopId: stopId ?? this.stopId,
+      etaLocal: etaLocal ?? this.etaLocal,
+      delaySeconds: delaySeconds ?? this.delaySeconds,
+      displayTrain: displayTrain ?? this.displayTrain,
+      vehicleLabel: vehicleLabel ?? this.vehicleLabel,
+      destinationMatched: destinationMatched ?? this.destinationMatched,
+      upcomingStops: upcomingStops ?? this.upcomingStops,
+      terminalStopId: terminalStopId ?? this.terminalStopId,
+      terminalStopIdCanon: terminalStopIdCanon ?? this.terminalStopIdCanon,
+      directionSource: directionSource ?? this.directionSource,
+    );
+  }
+
+  TripCandidate withPublicDirection({
+    required String direction,
+    required DirectionSource source,
+  }) {
+    final trimmed = direction.trim();
+    if (trimmed.isEmpty || source.confidence < directionSource.confidence) {
+      return this;
+    }
+    if (trimmed == terminalStopId && source == directionSource) return this;
+    return copyWith(
+      terminalStopId: trimmed,
+      terminalStopIdCanon: '',
+      directionSource: source,
+    );
+  }
+
+  TripCandidate copyWithDestination(StopEta stop) {
+    return copyWith(
       stopId: stop.stopIdRaw,
       etaLocal: stop.etaLocal,
       delaySeconds: stop.delaySeconds,
-      displayTrain: displayTrain,
-      vehicleLabel: vehicleLabel,
       destinationMatched: true,
-      upcomingStops: upcomingStops,
-      terminalStopId: terminalStopId,
-      terminalStopIdCanon: terminalStopIdCanon,
     );
   }
 }

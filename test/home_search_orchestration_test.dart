@@ -47,6 +47,7 @@ void main() {
       expect(enriched.delaySeconds, gtfs.delaySeconds);
       expect(enriched.displayTrain, gtfs.displayTrain);
       expect(enriched.upcomingStops, same(upcoming));
+      expect(enriched.directionSource, DirectionSource.stationboard);
     });
 
     test('ambiguous stationboard correspondence preserves GTFS direction', () {
@@ -98,8 +99,37 @@ void main() {
       final result = _enrich([gtfs], [stationboard], 'S20');
 
       expect(result.enrichedCount, 0);
-      expect(result.candidates.single, same(gtfs));
+      expect(result.candidates.single.publicDirection, 'Oensingen');
       expect(result.decisions.single.reason, 'direction-already-correct');
+      expect(
+        result.candidates.single.directionSource,
+        DirectionSource.stationboard,
+      );
+    });
+
+    test('stationboard cannot downgrade an OJP public direction', () {
+      final eta = DateTime(2026, 8, 27, 12);
+      final ojp = _candidate(
+        tripId: 'ojp-enriched',
+        line: 'S11',
+        eta: eta,
+        direction: 'Solothurn',
+        directionSource: DirectionSource.ojpStopEvent,
+      );
+      final stationboard = _candidate(
+        tripId: 'fallback-trip',
+        line: 'S11',
+        eta: eta.add(const Duration(seconds: 20)),
+        direction: 'Oensingen',
+      );
+
+      final result = _enrich([ojp], [stationboard], 'S11');
+
+      expect(result.candidates.single.publicDirection, 'Solothurn');
+      expect(
+        result.candidates.single.directionSource,
+        DirectionSource.ojpStopEvent,
+      );
     });
   });
 
@@ -159,6 +189,62 @@ void main() {
     await _dismissBottomSheet(tester);
     _expectCancelledWithoutAlarm(tester);
   });
+
+  testWidgets(
+    'local-line name rescue preserves candidate-specific opposite directions',
+    (tester) async {
+      final firstEta = DateTime.now().add(const Duration(minutes: 30));
+      final secondEta = firstEta.add(const Duration(minutes: 12));
+      final service = _FakeSearchTransportService(
+        strictCandidates: const [],
+        nameRescueCandidates: [
+          _candidate(
+            tripId: 'gtfs-towards-first-terminal',
+            line: 'S11',
+            eta: firstEta,
+            direction: 'Oensingen',
+          ),
+          _candidate(
+            tripId: 'gtfs-towards-second-terminal',
+            line: 'S11',
+            eta: secondEta,
+            direction: 'Oensingen',
+          ),
+        ],
+        stationboardCandidates: [
+          _candidate(
+            tripId: 'public-towards-first-terminal',
+            line: 'S11',
+            eta: firstEta.add(const Duration(seconds: 20)),
+            direction: 'Solothurn',
+          ),
+          _candidate(
+            tripId: 'public-towards-second-terminal',
+            line: 'S11',
+            eta: secondEta.add(const Duration(seconds: 25)),
+            direction: 'Oensingen',
+          ),
+        ],
+      );
+
+      await _startSearch(
+        tester,
+        service,
+        train: 'S11',
+        destination: 'Oberbipp',
+      );
+
+      expect(
+        service.calls,
+        containsAllInOrder(['strict-gtfs', 'name-rescue', 'stationboard']),
+      );
+      expect(find.text('→ Solothurn'), findsOneWidget);
+      expect(find.text('→ Oensingen'), findsOneWidget);
+
+      await _dismissBottomSheet(tester);
+      _expectCancelledWithoutAlarm(tester);
+    },
+  );
 
   testWidgets('dismissing direction picker cancels tracking', (tester) async {
     final eta = DateTime.now().add(const Duration(minutes: 30));
@@ -243,6 +329,7 @@ TripCandidate _candidate({
   int delaySeconds = 0,
   bool destinationMatched = true,
   List<StopEta> upcomingStops = const [],
+  DirectionSource directionSource = DirectionSource.gtfsRealtimeLastStop,
 }) {
   return TripCandidate(
     tripId: tripId,
@@ -258,6 +345,7 @@ TripCandidate _candidate({
     upcomingStops: upcomingStops,
     terminalStopId: direction,
     terminalStopIdCanon: '',
+    directionSource: directionSource,
   );
 }
 
@@ -299,10 +387,12 @@ class _FakeSearchTransportService extends TransportService {
   _FakeSearchTransportService({
     required this.strictCandidates,
     this.nameRescueCandidates = const [],
+    this.stationboardCandidates = const [],
   });
 
   final List<TripCandidate> strictCandidates;
   final List<TripCandidate> nameRescueCandidates;
+  final List<TripCandidate> stationboardCandidates;
   final List<String> calls = [];
   int resolveCalls = 0;
 
@@ -349,7 +439,7 @@ class _FakeSearchTransportService extends TransportService {
     bool resolveDestinationName = true,
   }) async {
     calls.add('stationboard');
-    return const [];
+    return stationboardCandidates;
   }
 
   @override

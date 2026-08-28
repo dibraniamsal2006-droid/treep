@@ -197,11 +197,15 @@ LocalDirectionEnrichmentResult enrichLocalLineDirections({
     }
 
     if (publicDirectionToken(gtfs) == fallbackDirection) {
-      output.add(gtfs);
+      final result = gtfs.withPublicDirection(
+        direction: best.candidate.publicDirection,
+        source: DirectionSource.stationboard,
+      );
+      output.add(result);
       decisions.add(
         LocalDirectionEnrichmentDecision(
           original: gtfs,
-          result: gtfs,
+          result: result,
           counterpart: best.candidate,
           etaDifferenceSeconds: best.etaDiff,
           reason: 'direction-already-correct',
@@ -211,22 +215,11 @@ LocalDirectionEnrichmentResult enrichLocalLineDirections({
     }
 
     final fallbackTerminalRaw = best.candidate.terminalStopId.trim();
-    final enriched = TripCandidate(
-      tripId: gtfs.tripId,
-      routeId: gtfs.routeId,
-      startDate: gtfs.startDate,
-      startTime: gtfs.startTime,
-      stopId: gtfs.stopId,
-      etaLocal: gtfs.etaLocal,
-      delaySeconds: gtfs.delaySeconds,
-      displayTrain: gtfs.displayTrain,
-      vehicleLabel: gtfs.vehicleLabel,
-      destinationMatched: gtfs.destinationMatched,
-      upcomingStops: gtfs.upcomingStops,
-      terminalStopId: fallbackTerminalRaw.isNotEmpty
+    final enriched = gtfs.withPublicDirection(
+      direction: fallbackTerminalRaw.isNotEmpty
           ? fallbackTerminalRaw
           : directionLabel(best.candidate),
-      terminalStopIdCanon: best.candidate.terminalStopIdCanon,
+      source: DirectionSource.stationboard,
     );
     output.add(enriched);
     decisions.add(
@@ -274,9 +267,15 @@ class _TreepHomeState extends State<TreepHome> {
   bool _isStartingTracking = false;
   String _trackingStatus = '';
   TripCandidate? _selectedCandidate;
-  List<int> _alarmIds = <int>[];
-  DateTime? _alarmFirstFire;
-  bool _nativeAlarmArmed = false;
+  static const NativeAlarmGateway _nativeAlarm =
+      MethodChannelNativeAlarmGateway();
+  late final AlarmTransactionCoordinator<TripCandidate> _alarmCoordinator;
+  int _nextNotificationBaseId = DateTime.now().millisecondsSinceEpoch.remainder(
+    1000000000,
+  );
+  DateTime? get _alarmFirstFire => _alarmCoordinator.confirmed?.fireTime;
+  bool get _nativeAlarmArmed =>
+      _alarmCoordinator.confirmed?.hasConfirmedNativeAlarm == true;
   // GTFS-RT plan is limited (e.g. 5 calls / minute). We throttle requests to avoid 429.
   // 5/min ~= 12s per call. Use 13s to be a little safer.
   Timer? _foregroundArmTimer;
@@ -301,6 +300,11 @@ class _TreepHomeState extends State<TreepHome> {
   @override
   void initState() {
     super.initState();
+    _alarmCoordinator = AlarmTransactionCoordinator<TripCandidate>(
+      native: _nativeAlarm,
+      notifications: const PluginAlarmNotificationGateway(),
+      nativeSchedulingEnabled: Platform.isIOS,
+    );
     _transportService =
         widget.transportService ??
         TransportService(
@@ -467,18 +471,21 @@ class _TreepHomeState extends State<TreepHome> {
   // === TREEP: ALARM LOGIC START ===
   Future<void> _stopAlarm() async {
     _stopForegroundRing();
-    await NativeAlarm.stop();
     _liveUpdateTimer?.cancel();
     _liveUpdateTimer = null;
     _sliderDebounce?.cancel();
     _sliderDebounce = null;
-    if (_alarmIds.isEmpty) return;
-    await NotificationService.cancelIds(_alarmIds);
+    _rescheduleToken++;
+    _isRescheduling = false;
+    final result = await _alarmCoordinator.stop();
+    if (!result.succeeded) {
+      debugPrint('[alarm] stop cleanup failed: ${result.failures.join("; ")}');
+    }
     if (!mounted) return;
     setState(() {
-      _alarmIds = <int>[];
-      _alarmFirstFire = null;
-      _nativeAlarmArmed = false;
+      if (!result.succeeded) {
+        _trackingStatus = 'Alarm stopped; native cleanup needs checking.';
+      }
     });
   }
 
@@ -492,14 +499,14 @@ class _TreepHomeState extends State<TreepHome> {
 
     _foregroundArmTimer = Timer(wait, () {
       if (!mounted) return;
-      if (_alarmIds.isEmpty) return;
+      if (_alarmCoordinator.confirmed == null) return;
 
       setState(() => _isRinging = true);
 
       // iOS: start the native loud alarm once when we reach the ring time.
       // (This is the only reliable way to get real audio in the foreground.)
       if (Platform.isIOS) {
-        NativeAlarm.startNow();
+        _nativeAlarm.startLegacyNow();
       }
 
       // HARD loop until Stop is pressed
@@ -570,7 +577,7 @@ class _TreepHomeState extends State<TreepHome> {
     if (!mounted) return;
     final current = _selectedCandidate;
     if (current == null) return;
-    if (_alarmIds.isEmpty || _alarmFirstFire == null) return; // nur wenn armed
+    if (_alarmCoordinator.confirmed == null) return; // nur wenn armed
     if (_isRescheduling) return;
 
     try {
@@ -596,7 +603,9 @@ class _TreepHomeState extends State<TreepHome> {
       if (etaDiff < 30 && delayDiff < 30) return;
 
       await _rescheduleAlarmWith(updated, reason: 'Verspätung/Update');
-    } catch (_) {}
+    } catch (error) {
+      debugPrint('[alarm] live refresh failed: $error');
+    }
   }
 
   Future<TripCandidate?> _refreshCandidateEta(TripCandidate c) async {
@@ -621,19 +630,26 @@ class _TreepHomeState extends State<TreepHome> {
     _isRescheduling = true;
     final token = ++_rescheduleToken;
 
-    setState(() {
-      _selectedCandidate = updated;
-      _trackingStatus =
-          'Update: $reason — ETA ${_hhmm(updated.etaLocal)} (${_fmtDelay(updated.delaySeconds)})';
-    });
-    _traceCandidate(
-      'selectedCandidate reassigned',
-      updated,
-      source: 'live-update',
-    );
-
     try {
-      await _armAlarmFor(updated, showUx: false);
+      final succeeded = await _armAlarmFor(
+        updated,
+        showUx: false,
+        requestPermissions: false,
+      );
+      if (succeeded && mounted) {
+        setState(() {
+          _selectedCandidate = updated;
+          _trackingStatus =
+              'Update: $reason — ETA ${_hhmm(updated.etaLocal)} (${_fmtDelay(updated.delaySeconds)})';
+        });
+        _traceCandidate(
+          'selectedCandidate reassigned',
+          updated,
+          source: 'live-update-confirmed',
+        );
+      } else if (!succeeded) {
+        debugPrint('[alarm] replacement failed; previous retained');
+      }
     } finally {
       if (token == _rescheduleToken) {
         _isRescheduling = false;
@@ -646,10 +662,11 @@ class _TreepHomeState extends State<TreepHome> {
     }
   }
 
-  Future<void> _armAlarmFor(TripCandidate chosen, {bool showUx = true}) async {
-    await _stopAlarm();
-    await NotificationService.requestPermissions();
-
+  Future<bool> _armAlarmFor(
+    TripCandidate chosen, {
+    bool showUx = true,
+    bool requestPermissions = true,
+  }) async {
     final minsBefore = _minutesBefore.round();
     final now = DateTime.now();
     DateTime first = chosen.etaLocal.subtract(Duration(minutes: minsBefore));
@@ -663,8 +680,8 @@ class _TreepHomeState extends State<TreepHome> {
     const interval = Duration(seconds: 45);
     const count = 12;
 
-    final baseId = (DateTime.now().millisecondsSinceEpoch % 1000000);
-    final ids = List<int>.generate(count, (i) => baseId + i);
+    final baseId = _nextNotificationBaseId;
+    _nextNotificationBaseId += count;
 
     final title = 'TREEP ALARM';
     final body =
@@ -685,24 +702,27 @@ class _TreepHomeState extends State<TreepHome> {
       await _maybeShowVolumeAndFocusDialog();
     }
 
-    await NotificationService.scheduleAlarmCluster(
-      baseId: baseId,
-      firstFire: first,
-      count: count,
-      interval: interval,
-      title: title,
-      body: body,
+    final result = await _alarmCoordinator.arm(
+      selection: chosen,
+      requestPermissions: requestPermissions,
+      plan: AlarmNotificationPlan(
+        baseId: baseId,
+        firstFire: first,
+        count: count,
+        interval: interval,
+        title: title,
+        body: body,
+      ),
     );
 
-    // Best-effort iOS loud alarm (native). Android continues with notifications only.
-    final nativeOk = Platform.isIOS ? await NativeAlarm.armAt(first) : false;
-
-    if (!mounted) return;
-    setState(() {
-      _alarmIds = ids;
-      _alarmFirstFire = first;
-      _nativeAlarmArmed = nativeOk;
-    });
+    if (!result.succeeded) {
+      debugPrint(
+        '[alarm] arm failed retained=${result.previousRetained}: ${result.failures.join("; ")}',
+      );
+      return false;
+    }
+    if (!mounted) return false;
+    setState(() {});
     _startForegroundRing(first);
     _startLiveUpdates();
 
@@ -728,6 +748,7 @@ class _TreepHomeState extends State<TreepHome> {
         _showSleepLineOverlay(sleepLine);
       });
     }
+    return true;
   }
 
   Future<void> _onMinutesBeforeChanged(double v) async {
@@ -738,7 +759,7 @@ class _TreepHomeState extends State<TreepHome> {
     _sliderDebounce = Timer(const Duration(milliseconds: 450), () async {
       final c = _selectedCandidate;
       if (c == null) return;
-      if (_alarmIds.isEmpty || _alarmFirstFire == null) return;
+      if (_alarmCoordinator.confirmed == null) return;
 
       await _rescheduleAlarmWith(
         c,
@@ -769,7 +790,7 @@ class _TreepHomeState extends State<TreepHome> {
     // Start sound (foreground) + strong haptics pattern for 3 seconds.
     try {
       if (Platform.isIOS) {
-        await NativeAlarm.startNow();
+        await _nativeAlarm.startLegacyNow();
       } else {
         SystemSound.play(SystemSoundType.alert);
       }
@@ -794,7 +815,7 @@ class _TreepHomeState extends State<TreepHome> {
     _selfTestStopper?.cancel();
     _selfTestStopper = Timer(const Duration(seconds: 3), () async {
       try {
-        await NativeAlarm.stop();
+        await _nativeAlarm.stopLegacyPlayback();
       } catch (_) {}
       _selfTestHapticTimer?.cancel();
       _selfTestHapticTimer = null;
@@ -1135,6 +1156,7 @@ class _TreepHomeState extends State<TreepHome> {
     final merged = TripCandidate(
       // Keep GTFS identity/timing for realtime refresh correctness.
       tripId: best.tripId,
+      originalTripId: best.originalTripId,
       routeId: best.routeId,
       startDate: best.startDate,
       startTime: best.startTime,
@@ -1150,6 +1172,7 @@ class _TreepHomeState extends State<TreepHome> {
       upcomingStops: best.upcomingStops,
       terminalStopId: mergedTerminalRaw,
       terminalStopIdCanon: mergedTerminalCanon,
+      directionSource: fallbackCandidate.directionSource,
     );
 
     _trace(
@@ -1947,55 +1970,6 @@ class _TreepHomeState extends State<TreepHome> {
         final isLocalLineQuery =
             MatchingService.gtfsBridgeDecisionReason(trainQuery) ==
             'local-s-line';
-        if (candidates.isNotEmpty && isLocalLineQuery) {
-          final destCanon = _normalizeStopId(effectiveDest) ?? effectiveDest;
-          final localDirectionCandidates = await _fallbackArrivalsAtDestination(
-            trainQuery: trainQuery,
-            destStopIdCanons: destWasName
-                ? destAlternatives
-                : <String>[destCanon],
-            destNameQuery: destWasName ? destQuery : null,
-            limit: 220,
-            resolveDestinationName: false,
-          );
-          if (!mounted) return;
-
-          final enrichment = enrichLocalLineDirections(
-            gtfsCandidates: candidates,
-            stationboardCandidates: localDirectionCandidates,
-            trainQuery: trainQuery,
-            stopIdsMatch: _stopIdMatches,
-            directionLabel: _terminalLabel,
-          );
-          candidates = enrichment.candidates;
-          if (enrichment.enrichedCount > 0) {
-            candidateSource = 'gtfs-rt-local-direction-enriched';
-          }
-          _trace(
-            'Local-line direction enrichment gtfsCount=${candidates.length} '
-            'stationboardCount=${localDirectionCandidates.length} '
-            'enrichedCount=${enrichment.enrichedCount}',
-          );
-          for (final decision in enrichment.decisions.take(12)) {
-            final counterpart = decision.counterpart;
-            _trace(
-              'Local-line direction decision gtfsTripId=${decision.original.tripId} '
-              'gtfsEta=${decision.original.etaLocal.toIso8601String()} '
-              'gtfsDirection="${_terminalLabel(decision.original)}" '
-              'stationboardTripId=${counterpart?.tripId ?? "none"} '
-              'stationboardEta=${counterpart?.etaLocal.toIso8601String() ?? "none"} '
-              'stationboardDirection="${counterpart == null ? "" : _terminalLabel(counterpart)}" '
-              'etaDiffSec=${decision.etaDifferenceSeconds ?? -1} '
-              'result=${decision.reason} '
-              'finalDirection="${_terminalLabel(decision.result)}"',
-            );
-          }
-          if (enrichment.decisions.length > 12) {
-            _trace(
-              'Local-line direction decisions truncated=${enrichment.decisions.length - 12}',
-            );
-          }
-        }
 
         // A destination-aware name rescue is more trustworthy than broad
         // train-only GTFS results and must run before either broad fallback.
@@ -2212,6 +2186,85 @@ class _TreepHomeState extends State<TreepHome> {
                   'Only train matches were found. Destination confirmation will be required before tracking starts.';
             });
           }
+        }
+
+        final hasGtfsDirectionSource =
+            candidateSource == 'gtfs-rt-strict' ||
+            candidateSource == 'gtfs-stop-name-rescue' ||
+            candidateSource == 'gtfs-train-only-unverified';
+        if (candidates.isNotEmpty &&
+            isLocalLineQuery &&
+            hasGtfsDirectionSource) {
+          final directionSource = candidateSource;
+          final destCanon = _normalizeStopId(effectiveDest) ?? effectiveDest;
+          final localDirectionCandidates = await _fallbackArrivalsAtDestination(
+            trainQuery: trainQuery,
+            destStopIdCanons: destWasName
+                ? destAlternatives
+                : <String>[destCanon],
+            destNameQuery: destWasName ? destQuery : null,
+            limit: 220,
+            resolveDestinationName: false,
+          );
+          if (!mounted) return;
+
+          final enrichment = enrichLocalLineDirections(
+            gtfsCandidates: candidates,
+            stationboardCandidates: localDirectionCandidates,
+            trainQuery: trainQuery,
+            stopIdsMatch: _stopIdMatches,
+            directionLabel: _terminalLabel,
+          );
+          candidates = enrichment.candidates;
+          if (enrichment.enrichedCount > 0) {
+            candidateSource = '$directionSource-local-direction-enriched';
+          }
+          _trace(
+            'Local-line direction enrichment source=$directionSource '
+            'gtfsCount=${candidates.length} '
+            'stationboardCount=${localDirectionCandidates.length} '
+            'enrichedCount=${enrichment.enrichedCount}',
+          );
+          for (final decision in enrichment.decisions.take(12)) {
+            final counterpart = decision.counterpart;
+            _trace(
+              'Local-line direction decision gtfsTripId=${decision.original.tripId} '
+              'gtfsEta=${decision.original.etaLocal.toIso8601String()} '
+              'gtfsDirection="${_terminalLabel(decision.original)}" '
+              'stationboardTripId=${counterpart?.tripId ?? "none"} '
+              'stationboardEta=${counterpart?.etaLocal.toIso8601String() ?? "none"} '
+              'stationboardDirection="${counterpart == null ? "" : _terminalLabel(counterpart)}" '
+              'etaDiffSec=${decision.etaDifferenceSeconds ?? -1} '
+              'result=${decision.reason} '
+              'finalDirection="${_terminalLabel(decision.result)}"',
+            );
+          }
+          if (enrichment.decisions.length > 12) {
+            _trace(
+              'Local-line direction decisions truncated=${enrichment.decisions.length - 12}',
+            );
+          }
+        }
+
+        if (candidates.isNotEmpty) {
+          final beforeOjp = candidates;
+          candidates = await _transportService.enrichPublicDirections(
+            candidates,
+          );
+          if (!mounted) return;
+          final ojpEnriched = candidates
+              .where(
+                (candidate) =>
+                    candidate.directionSource == DirectionSource.ojpStopEvent,
+              )
+              .length;
+          if (ojpEnriched > 0) {
+            candidateSource = '$candidateSource-ojp-direction';
+          }
+          _trace(
+            'OJP public-direction enrichment input=${beforeOjp.length} '
+            'output=${candidates.length} trusted=$ojpEnriched',
+          );
         }
 
         // This branch is retained for compatibility if the surrounding flow is
@@ -2683,7 +2736,7 @@ class _TreepHomeState extends State<TreepHome> {
   @override
   Widget build(BuildContext context) {
     final c = _selectedCandidate;
-    final hasAlarm = _alarmIds.isNotEmpty && _alarmFirstFire != null;
+    final hasAlarm = _alarmCoordinator.confirmed != null;
 
     return Scaffold(
       body: SafeArea(

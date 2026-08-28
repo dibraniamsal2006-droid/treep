@@ -191,6 +191,219 @@ void main() {
     },
   );
 
+  group('destination stationboard stop recovery', () {
+    const primaryId = '8501001';
+    const firstAlternateId = '8501002';
+    const secondAlternateId = '8501003';
+    const stopNames = <String, String>{
+      primaryId: 'Oensingen',
+      firstAlternateId: 'Oensingen, Bahnhof',
+      secondAlternateId: 'Oensingen, Bahnhof Süd',
+    };
+
+    TransportService serviceFor({
+      required Map<String, List<Map<String, dynamic>>> stationboards,
+      required List<String> fetchedStationboards,
+    }) {
+      return TransportService(
+        httpGet: (uri, {headers}) async {
+          if (uri.path.endsWith('/locations')) {
+            final id = uri.queryParameters['id'];
+            if (id != null) {
+              return _jsonResponse({
+                'stations': [
+                  {'id': id, 'name': stopNames[id] ?? id},
+                ],
+              });
+            }
+            return _jsonResponse({
+              'stations': stopNames.entries
+                  .map((entry) => {'id': entry.key, 'name': entry.value})
+                  .toList(),
+            });
+          }
+          if (uri.path.endsWith('/stationboard')) {
+            final id = uri.queryParameters['id']!;
+            fetchedStationboards.add(id);
+            return _jsonResponse({
+              'stationboard': stationboards[id] ?? const <Object>[],
+            });
+          }
+          return http.Response('not found', 404);
+        },
+      );
+    }
+
+    test('normal query stops after usable primary station', () async {
+      final fetched = <String>[];
+      final scheduled = DateTime.now().add(const Duration(hours: 1));
+      final service = serviceFor(
+        fetchedStationboards: fetched,
+        stationboards: {
+          primaryId: [_stationboardItem(scheduled: scheduled)],
+          firstAlternateId: [
+            _stationboardItem(
+              scheduled: scheduled.add(const Duration(minutes: 5)),
+            ),
+          ],
+        },
+      );
+
+      final candidates = await service.fallbackArrivalsAtDestination(
+        trainQuery: '',
+        destStopIdCanons: const [
+          primaryId,
+          firstAlternateId,
+          secondAlternateId,
+        ],
+        destNameQuery: 'Oensingen Bahnhof',
+        resolveDestinationName: false,
+      );
+
+      expect(fetched, [primaryId]);
+      expect(candidates, hasLength(1));
+      expect(candidates.single.stopId, primaryId);
+    });
+
+    test('empty primary falls through to the first usable alternate', () async {
+      final fetched = <String>[];
+      final scheduled = DateTime.now().add(const Duration(hours: 1));
+      final service = serviceFor(
+        fetchedStationboards: fetched,
+        stationboards: {
+          primaryId: const [],
+          firstAlternateId: [_stationboardItem(scheduled: scheduled)],
+        },
+      );
+
+      final candidates = await service.fallbackArrivalsAtDestination(
+        trainQuery: '',
+        destStopIdCanons: const [primaryId, firstAlternateId],
+        destNameQuery: 'Oensingen Bahnhof',
+        resolveDestinationName: false,
+      );
+
+      expect(fetched, [primaryId, firstAlternateId]);
+      expect(candidates.single.stopId, firstAlternateId);
+    });
+
+    test(
+      'successful recovery prevents later alternatives from merging',
+      () async {
+        final fetched = <String>[];
+        final scheduled = DateTime.now().add(const Duration(hours: 1));
+        final service = serviceFor(
+          fetchedStationboards: fetched,
+          stationboards: {
+            primaryId: const [],
+            firstAlternateId: [_stationboardItem(scheduled: scheduled)],
+            secondAlternateId: [
+              _stationboardItem(
+                scheduled: scheduled.add(const Duration(minutes: 5)),
+              ),
+            ],
+          },
+        );
+
+        final candidates = await service.fallbackArrivalsAtDestination(
+          trainQuery: '',
+          destStopIdCanons: const [
+            primaryId,
+            firstAlternateId,
+            secondAlternateId,
+          ],
+          destNameQuery: 'Oensingen Bahnhof',
+          resolveDestinationName: false,
+        );
+
+        expect(fetched, [primaryId, firstAlternateId]);
+        expect(candidates, hasLength(1));
+        expect(candidates.single.stopId, firstAlternateId);
+      },
+    );
+
+    test(
+      'explicit local qualifier preserves bounded multi-stop fetch',
+      () async {
+        final fetched = <String>[];
+        final scheduled = DateTime.now().add(const Duration(hours: 1));
+        final service = serviceFor(
+          fetchedStationboards: fetched,
+          stationboards: {
+            primaryId: [_stationboardItem(scheduled: scheduled)],
+            firstAlternateId: [
+              _stationboardItem(
+                scheduled: scheduled.add(const Duration(minutes: 5)),
+              ),
+            ],
+            secondAlternateId: [
+              _stationboardItem(
+                scheduled: scheduled.add(const Duration(minutes: 10)),
+              ),
+            ],
+          },
+        );
+
+        final candidates = await service.fallbackArrivalsAtDestination(
+          trainQuery: '',
+          destStopIdCanons: const [
+            primaryId,
+            firstAlternateId,
+            secondAlternateId,
+          ],
+          destNameQuery: 'Oensingen Bahnhof Süd',
+          resolveDestinationName: false,
+        );
+
+        expect(fetched, [primaryId, firstAlternateId, secondAlternateId]);
+        expect(candidates, hasLength(3));
+      },
+    );
+
+    test('train filter recovers when primary has only another line', () async {
+      final fetched = <String>[];
+      final scheduled = DateTime.now().add(const Duration(hours: 1));
+      final service = serviceFor(
+        fetchedStationboards: fetched,
+        stationboards: {
+          primaryId: [
+            _stationboardItem(
+              scheduled: scheduled,
+              category: 'IC',
+              number: '5',
+            ),
+          ],
+          firstAlternateId: [
+            _stationboardItem(
+              scheduled: scheduled.add(const Duration(minutes: 5)),
+            ),
+          ],
+          secondAlternateId: [
+            _stationboardItem(
+              scheduled: scheduled.add(const Duration(minutes: 10)),
+            ),
+          ],
+        },
+      );
+
+      final candidates = await service.fallbackArrivalsAtDestination(
+        trainQuery: 'IR55',
+        destStopIdCanons: const [
+          primaryId,
+          firstAlternateId,
+          secondAlternateId,
+        ],
+        destNameQuery: 'Oensingen Bahnhof',
+        resolveDestinationName: false,
+      );
+
+      expect(fetched, [primaryId, firstAlternateId]);
+      expect(candidates, hasLength(1));
+      expect(candidates.single.displayTrain, 'IR55');
+      expect(candidates.single.stopId, firstAlternateId);
+    });
+  });
+
   test(
     'filtered fallback can recover from a failed primary strong stop',
     () async {
@@ -259,11 +472,13 @@ Map<String, dynamic> _stationboardItem({
   required DateTime scheduled,
   DateTime? prognosisArrival,
   DateTime? prognosisDeparture,
+  String category = 'IR',
+  String number = '55',
 }) {
   return {
-    'name': 'IR 55',
-    'category': 'IR',
-    'number': '55',
+    'name': '$category $number',
+    'category': category,
+    'number': number,
     'to': 'Zürich HB',
     'stop': {
       'arrivalTimestamp': scheduled.toUtc().millisecondsSinceEpoch ~/ 1000,
