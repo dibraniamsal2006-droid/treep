@@ -185,6 +185,8 @@ void main() {
     expect(service.calls, containsAllInOrder(['strict-gtfs', 'name-rescue']));
     expect(service.calls, isNot(contains('stationboard')));
     expect(service.calls, isNot(contains('broad-gtfs')));
+    expect(find.text('Direction Zürich HB'), findsOneWidget);
+    expect(find.text('Direction Biel/Bienne'), findsOneWidget);
 
     await _dismissBottomSheet(tester);
     _expectCancelledWithoutAlarm(tester);
@@ -238,8 +240,9 @@ void main() {
         service.calls,
         containsAllInOrder(['strict-gtfs', 'name-rescue', 'stationboard']),
       );
-      expect(find.text('→ Solothurn'), findsOneWidget);
-      expect(find.text('→ Oensingen'), findsOneWidget);
+      expect(service.stationboardTrainQueries, contains('S11'));
+      expect(find.text('Direction Solothurn'), findsOneWidget);
+      expect(find.text('Direction Oensingen'), findsOneWidget);
 
       await _dismissBottomSheet(tester);
       _expectCancelledWithoutAlarm(tester);
@@ -360,8 +363,10 @@ Future<void> _startSearch(
   );
   await tester.enterText(find.byType(TextField).at(0), train);
   await tester.enterText(find.byType(TextField).at(1), destination);
-  await tester.tap(find.text('Start tracking'));
-  await tester.pumpAndSettle();
+  await tester.ensureVisible(find.byKey(const Key('choose-journey-button')));
+  await tester.tap(find.byKey(const Key('choose-journey-button')));
+  await tester.pump();
+  await tester.pump(const Duration(milliseconds: 600));
 }
 
 void _expectCancelledWithoutAlarm(WidgetTester tester) {
@@ -369,18 +374,16 @@ void _expectCancelledWithoutAlarm(WidgetTester tester) {
     find.text('Selection cancelled. No tracking was started.'),
     findsOneWidget,
   );
-  expect(find.textContaining('Alarm: armed for'), findsNothing);
-  final setAlarm = tester.widget<ElevatedButton>(
-    find.widgetWithText(ElevatedButton, 'Set alarm'),
-  );
-  expect(setAlarm.onPressed, isNull);
+  expect(find.text('Active journey'), findsNothing);
+  expect(find.byKey(const Key('alarm-confirmation')), findsNothing);
 }
 
 Future<void> _dismissBottomSheet(WidgetTester tester) async {
   final sheet = find.byType(BottomSheet);
   expect(sheet, findsOneWidget);
   Navigator.of(tester.element(sheet)).pop();
-  await tester.pumpAndSettle();
+  await tester.pump();
+  await tester.pump(const Duration(milliseconds: 500));
 }
 
 class _FakeSearchTransportService extends TransportService {
@@ -394,6 +397,7 @@ class _FakeSearchTransportService extends TransportService {
   final List<TripCandidate> nameRescueCandidates;
   final List<TripCandidate> stationboardCandidates;
   final List<String> calls = [];
+  final List<String> stationboardTrainQueries = [];
   int resolveCalls = 0;
 
   @override
@@ -439,6 +443,7 @@ class _FakeSearchTransportService extends TransportService {
     bool resolveDestinationName = true,
   }) async {
     calls.add('stationboard');
+    stationboardTrainQueries.add(trainQuery);
     return stationboardCandidates;
   }
 

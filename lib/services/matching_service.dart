@@ -444,6 +444,64 @@ class MatchingService {
     return 'Train';
   }
 
+  static String publicServicePresentationLabel({
+    required String publicLine,
+    required String modeLabel,
+  }) {
+    final trimmed = publicLine.trim();
+    final compact = normalizeTrainToken(trimmed);
+    final isDigitsOnly = RegExp(r'^\d{1,4}$').hasMatch(compact);
+    final isKnownPublicCategory = RegExp(
+      r'^(?:s|sn|r|re|ir|ic|ec|ice|tgv|rj|rjx|pe|b|n|m|t)(?:\d{1,3})?$',
+    ).hasMatch(compact);
+    if (trimmed.isNotEmpty && (isDigitsOnly || isKnownPublicCategory)) {
+      return trimmed;
+    }
+
+    final mode = modeLabel.trim();
+    const allowedModes = <String>{'Bus', 'Train', 'Tram', 'Ship'};
+    return allowedModes.contains(mode) ? mode : '';
+  }
+
+  static bool looksTechnicalIdentifier(String value) {
+    final normalized = value.trim().toLowerCase();
+    if (normalized.isEmpty) return false;
+    return normalized.startsWith('ojp:') ||
+        normalized.startsWith('.ojp') ||
+        normalized.startsWith('ch:1:') ||
+        normalized.contains(':sjyid:') ||
+        normalized.contains(':sloid:');
+  }
+
+  static String vehicleLabelFromPublicMode({
+    required String modeOrCategory,
+    required String displayLine,
+  }) {
+    final mode = normalizeTrainToken(modeOrCategory);
+    if (mode == 'bus' || mode == 'b') return 'Bus';
+    if (mode == 'tram' || mode == 't') return 'Tram';
+    return vehicleLabelFromDisplay(displayLine);
+  }
+
+  static bool matchesPublicServiceQuery({
+    required String query,
+    required String publicLine,
+    required String modeOrCategory,
+  }) {
+    if (matchesTrainQuery(query, publicLine)) return true;
+
+    final queryIdentity = _PublicTrainIdentity.parse(query);
+    final lineIdentity = _PublicTrainIdentity.parse(publicLine);
+    if (!queryIdentity.isLettersAndDigits || !lineIdentity.isDigitsOnly) {
+      return false;
+    }
+    if (queryIdentity.digits != lineIdentity.digits) return false;
+
+    final mode = normalizeTrainToken(modeOrCategory);
+    return (mode == 'bus' && queryIdentity.letters == 'b') ||
+        (mode == 'tram' && queryIdentity.letters == 't');
+  }
+
   static String terminalLabelFor(
     TripCandidate candidate, {
     required StopLabelResolver stopLabel,

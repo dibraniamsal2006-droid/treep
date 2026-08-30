@@ -1,3 +1,5 @@
+import 'dart:async';
+
 import 'package:flutter/foundation.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_local_notifications/flutter_local_notifications.dart';
@@ -24,6 +26,14 @@ enum NativeAlarmState {
   unknown,
 }
 
+enum NativeAlarmProtectionStatus {
+  protected,
+  paused,
+  missingBeforeFire,
+  missingAfterFire,
+  unverified,
+}
+
 class NativeAlarmCapabilities {
   const NativeAlarmCapabilities({
     required this.alarmKitSupported,
@@ -41,6 +51,8 @@ class NativeAlarmRecord {
     required this.scheduledFireTime,
     required this.state,
     required this.backend,
+    this.sessionId,
+    this.revision,
   });
 
   final String id;
@@ -48,11 +60,56 @@ class NativeAlarmRecord {
   final DateTime? scheduledFireTime;
   final NativeAlarmState state;
   final NativeAlarmBackend backend;
+  final String? sessionId;
+  final int? revision;
 
   bool get isConfirmed =>
       backend == NativeAlarmBackend.alarmKit &&
       (state == NativeAlarmState.scheduled ||
+          state == NativeAlarmState.countdown ||
           state == NativeAlarmState.alerting);
+}
+
+class NativeAlarmSessionSnapshot {
+  const NativeAlarmSessionSnapshot({
+    required this.reconciliationAvailable,
+    this.lifecycleHealthy = true,
+    required this.sessionExists,
+    required this.isProtected,
+    required this.protectionStatus,
+    this.sessionId,
+    this.revision,
+    this.alarmId,
+    this.requestedFireTime,
+    this.state = NativeAlarmState.unknown,
+    this.preparedSessionId,
+    this.preparedRevision,
+    this.preparedAlarmId,
+  });
+
+  final bool reconciliationAvailable;
+  final bool lifecycleHealthy;
+  final bool sessionExists;
+  final bool isProtected;
+  final NativeAlarmProtectionStatus protectionStatus;
+  final String? sessionId;
+  final int? revision;
+  final String? alarmId;
+  final DateTime? requestedFireTime;
+  final NativeAlarmState state;
+  final String? preparedSessionId;
+  final int? preparedRevision;
+  final String? preparedAlarmId;
+
+  bool currentMatches(NativeAlarmRecord alarm) =>
+      sessionId == alarm.sessionId &&
+      revision == alarm.revision &&
+      alarmId == alarm.id;
+
+  bool preparedMatches(NativeAlarmRecord alarm) =>
+      preparedSessionId == alarm.sessionId &&
+      preparedRevision == alarm.revision &&
+      preparedAlarmId == alarm.id;
 }
 
 class NativeAlarmScheduleResult {
@@ -62,6 +119,7 @@ class NativeAlarmScheduleResult {
     required this.backend,
     this.alarm,
     this.failure,
+    this.unresolved = false,
   });
 
   final bool accepted;
@@ -69,6 +127,7 @@ class NativeAlarmScheduleResult {
   final NativeAlarmBackend backend;
   final NativeAlarmRecord? alarm;
   final String? failure;
+  final bool unresolved;
 }
 
 class NativeAlarmQueryResult {
@@ -78,10 +137,19 @@ class NativeAlarmQueryResult {
 }
 
 class AlarmOperationResult {
-  const AlarmOperationResult.success() : succeeded = true, failure = null;
-  const AlarmOperationResult.failure(this.failure) : succeeded = false;
+  const AlarmOperationResult.success()
+    : succeeded = true,
+      isAmbiguous = false,
+      failure = null;
+  const AlarmOperationResult.failure(this.failure)
+    : succeeded = false,
+      isAmbiguous = false;
+  const AlarmOperationResult.ambiguous(this.failure)
+    : succeeded = false,
+      isAmbiguous = true;
 
   final bool succeeded;
+  final bool isAmbiguous;
   final String? failure;
 }
 
@@ -90,9 +158,11 @@ abstract interface class NativeAlarmGateway {
   Future<NativeAlarmAuthorization> authorizationState();
   Future<NativeAlarmAuthorization> requestAuthorization();
   Future<NativeAlarmScheduleResult> schedule(DateTime fireAt);
+  Future<AlarmOperationResult> promoteSession(NativeAlarmRecord alarm);
+  Future<NativeAlarmSessionSnapshot> sessionSnapshot();
   Future<NativeAlarmQueryResult> alarms();
-  Future<AlarmOperationResult> cancel(String alarmId);
-  Future<AlarmOperationResult> stopAlerting(String alarmId);
+  Future<AlarmOperationResult> cancel(NativeAlarmRecord alarm);
+  Future<AlarmOperationResult> stopAlerting(NativeAlarmRecord alarm);
   Future<AlarmOperationResult> startLegacyNow();
   Future<AlarmOperationResult> stopLegacyPlayback();
 }
@@ -163,6 +233,7 @@ class MethodChannelNativeAlarmGateway implements NativeAlarmGateway {
         backend: _backend(value['backend']),
         alarm: alarm,
         failure: value['failure']?.toString(),
+        unresolved: value['unresolved'] == true,
       );
     } catch (error) {
       return NativeAlarmScheduleResult(
@@ -170,6 +241,56 @@ class MethodChannelNativeAlarmGateway implements NativeAlarmGateway {
         confirmed: false,
         backend: NativeAlarmBackend.unavailable,
         failure: error.toString(),
+      );
+    }
+  }
+
+  @override
+  Future<AlarmOperationResult> promoteSession(NativeAlarmRecord alarm) {
+    final sessionId = alarm.sessionId;
+    final revision = alarm.revision;
+    if (sessionId == null || revision == null) {
+      return Future.value(
+        const AlarmOperationResult.failure(
+          'Scheduled AlarmKit alarm has no prepared session identity',
+        ),
+      );
+    }
+    return _operation('promoteSession', {
+      'sessionId': sessionId,
+      'revision': revision,
+      'alarmId': alarm.id,
+    });
+  }
+
+  @override
+  Future<NativeAlarmSessionSnapshot> sessionSnapshot() async {
+    try {
+      final value = _map(
+        await _channel.invokeMethod<dynamic>('sessionSnapshot'),
+      );
+      return NativeAlarmSessionSnapshot(
+        reconciliationAvailable: value['reconciliationAvailable'] == true,
+        lifecycleHealthy: value['lifecycleHealth'] == 'healthy',
+        sessionExists: value['sessionExists'] == true,
+        isProtected: value['protected'] == true,
+        protectionStatus: _protectionStatus(value['protectionStatus']),
+        sessionId: value['sessionId']?.toString(),
+        revision: (value['revision'] as num?)?.round(),
+        alarmId: value['alarmId']?.toString(),
+        requestedFireTime: _date(value['requestedFireTimeMs']),
+        state: _state(value['state']),
+        preparedSessionId: value['preparedSessionId']?.toString(),
+        preparedRevision: (value['preparedRevision'] as num?)?.round(),
+        preparedAlarmId: value['preparedAlarmId']?.toString(),
+      );
+    } catch (error) {
+      debugPrint('[alarm] native session snapshot failed: $error');
+      return const NativeAlarmSessionSnapshot(
+        reconciliationAvailable: false,
+        sessionExists: false,
+        isProtected: false,
+        protectionStatus: NativeAlarmProtectionStatus.unverified,
       );
     }
   }
@@ -196,11 +317,19 @@ class MethodChannelNativeAlarmGateway implements NativeAlarmGateway {
   }
 
   @override
-  Future<AlarmOperationResult> cancel(String alarmId) =>
-      _operation('cancel', {'alarmId': alarmId});
+  Future<AlarmOperationResult> cancel(NativeAlarmRecord alarm) =>
+      _operation('cancel', {
+        'alarmId': alarm.id,
+        if (alarm.sessionId != null) 'sessionId': alarm.sessionId,
+        if (alarm.revision != null) 'revision': alarm.revision,
+      });
   @override
-  Future<AlarmOperationResult> stopAlerting(String alarmId) =>
-      _operation('stopAlerting', {'alarmId': alarmId});
+  Future<AlarmOperationResult> stopAlerting(NativeAlarmRecord alarm) =>
+      _operation('stopAlerting', {
+        'alarmId': alarm.id,
+        if (alarm.sessionId != null) 'sessionId': alarm.sessionId,
+        if (alarm.revision != null) 'revision': alarm.revision,
+      });
   @override
   Future<AlarmOperationResult> startLegacyNow() =>
       _operation('startNow', {'loop': true});
@@ -212,16 +341,23 @@ class MethodChannelNativeAlarmGateway implements NativeAlarmGateway {
     Map<String, dynamic>? arguments,
   ]) async {
     try {
-      final value = _map(
-        await _channel.invokeMethod<dynamic>(method, arguments),
-      );
+      final raw = await _channel.invokeMethod<dynamic>(method, arguments);
+      if (raw is! Map) {
+        return AlarmOperationResult.ambiguous(
+          '$method returned malformed data',
+        );
+      }
+      final value = _map(raw);
+      if (value['succeeded'] is! bool) {
+        return AlarmOperationResult.ambiguous('$method returned no outcome');
+      }
       return value['succeeded'] == true
           ? const AlarmOperationResult.success()
           : AlarmOperationResult.failure(
               value['failure']?.toString() ?? '$method failed',
             );
     } catch (error) {
-      return AlarmOperationResult.failure(error.toString());
+      return AlarmOperationResult.ambiguous(error.toString());
     }
   }
 
@@ -238,6 +374,8 @@ class MethodChannelNativeAlarmGateway implements NativeAlarmGateway {
       scheduledFireTime: _date(value['scheduledFireTimeMs']),
       state: _state(value['state']),
       backend: _backend(value['backend']),
+      sessionId: value['sessionId']?.toString(),
+      revision: (value['revision'] as num?)?.round(),
     );
   }
 
@@ -266,6 +404,14 @@ class MethodChannelNativeAlarmGateway implements NativeAlarmGateway {
     'bestEffort' => NativeAlarmState.bestEffort,
     _ => NativeAlarmState.unknown,
   };
+  static NativeAlarmProtectionStatus _protectionStatus(dynamic value) =>
+      switch ('$value') {
+        'protected' => NativeAlarmProtectionStatus.protected,
+        'paused' => NativeAlarmProtectionStatus.paused,
+        'missingBeforeFire' => NativeAlarmProtectionStatus.missingBeforeFire,
+        'missingAfterFire' => NativeAlarmProtectionStatus.missingAfterFire,
+        _ => NativeAlarmProtectionStatus.unverified,
+      };
 }
 
 class AlarmNotificationPlan {
@@ -356,11 +502,13 @@ class AlarmArmResult<T> {
     required this.confirmed,
     required this.previousRetained,
     required this.failures,
+    this.transactionUnverified = false,
   });
   final bool succeeded;
   final ConfirmedAlarm<T>? confirmed;
   final bool previousRetained;
   final List<String> failures;
+  final bool transactionUnverified;
 }
 
 class AlarmStopResult {
@@ -388,16 +536,34 @@ class AlarmTransactionCoordinator<T> {
   final AlarmTrace _trace;
   int _generation = 0;
   final Set<int> _pendingNotificationCleanupIds = <int>{};
+  final Set<Completer<void>> _nativeTransactions = <Completer<void>>{};
+  Future<AlarmStopResult>? _activeStop;
   ConfirmedAlarm<T>? confirmed;
+  ConfirmedAlarm<T>? _unresolvedNativeTransaction;
 
   Set<int> get pendingNotificationCleanupIds =>
       Set<int>.unmodifiable(_pendingNotificationCleanupIds);
+  bool get hasUnresolvedNativeTransaction =>
+      _unresolvedNativeTransaction != null;
 
   Future<AlarmArmResult<T>> arm({
     required T selection,
     required AlarmNotificationPlan plan,
     required bool requestPermissions,
   }) async {
+    if (_unresolvedNativeTransaction != null ||
+        _activeStop != null ||
+        _nativeTransactions.isNotEmpty) {
+      return AlarmArmResult<T>(
+        succeeded: false,
+        confirmed: confirmed,
+        previousRetained: false,
+        failures: const [
+          'native alarm lifecycle is unresolved or still in progress; stop or relaunch before re-arming',
+        ],
+        transactionUnverified: true,
+      );
+    }
     final generation = ++_generation;
     final previous = confirmed;
     _trace(
@@ -465,80 +631,197 @@ class AlarmTransactionCoordinator<T> {
         authorization == NativeAlarmAuthorization.authorized;
     final useLegacy =
         _nativeSchedulingEnabled && !capabilities.alarmKitSupported;
-    if (useAlarmKit || useLegacy) {
-      _trace('[alarm] native schedule requested');
-      native = await _native.schedule(plan.firstFire);
-      if (native.confirmed) {
-        _trace('[alarm] native schedule confirmed id=${native.alarm?.id}');
-      } else if (!native.accepted || native.failure != null) {
-        failures.add('native schedule: ${native.failure ?? "not confirmed"}');
+    final nativeTransaction = useAlarmKit || useLegacy
+        ? _beginNativeTransaction()
+        : null;
+    try {
+      if (useAlarmKit || useLegacy) {
+        _trace('[alarm] native schedule requested');
+        native = await _native.schedule(plan.firstFire);
+        if (native.confirmed) {
+          _trace('[alarm] native schedule confirmed id=${native.alarm?.id}');
+        } else if (!native.accepted || native.failure != null) {
+          failures.add('native schedule: ${native.failure ?? "not confirmed"}');
+        }
+      } else if (capabilities.alarmKitSupported) {
+        failures.add('AlarmKit authorization=${authorization.name}');
       }
-    } else if (capabilities.alarmKitSupported) {
-      failures.add('AlarmKit authorization=${authorization.name}');
-    }
 
-    final prepared = ConfirmedAlarm<T>(
-      selection: selection,
-      fireTime: plan.firstFire,
-      notificationIds: List<int>.unmodifiable(notifications.ids),
-      notificationFallbackConfirmed: notifications.succeeded,
-      nativeAlarm: native?.alarm,
-    );
-    if (generation != _generation) {
-      await _discard(prepared, failures);
-      failures.add('arm superseded by a newer lifecycle operation');
-      return AlarmArmResult<T>(
-        succeeded: false,
-        confirmed: confirmed,
-        previousRetained: confirmed != null,
-        failures: List<String>.unmodifiable(failures),
+      final prepared = ConfirmedAlarm<T>(
+        selection: selection,
+        fireTime: plan.firstFire,
+        notificationIds: List<int>.unmodifiable(notifications.ids),
+        notificationFallbackConfirmed: notifications.succeeded,
+        nativeAlarm: native?.alarm,
       );
-    }
-    // A replacement may not silently downgrade an existing confirmed AlarmKit
-    // alarm. On legacy platforms, the completed notification cluster is the
-    // confirmed protection path.
-    final usable = previous?.hasConfirmedNativeAlarm == true
-        ? prepared.hasConfirmedNativeAlarm
-        : prepared.hasConfirmedNativeAlarm || prepared.hasNotificationFallback;
-    if (!usable) {
-      await _discard(prepared, failures);
+      if (generation != _generation) {
+        await _discard(prepared, failures);
+        failures.add('arm superseded by a newer lifecycle operation');
+        return AlarmArmResult<T>(
+          succeeded: false,
+          confirmed: confirmed,
+          previousRetained: confirmed != null,
+          failures: List<String>.unmodifiable(failures),
+          transactionUnverified: _unresolvedNativeTransaction != null,
+        );
+      }
+      if (native?.unresolved == true) {
+        _unresolvedNativeTransaction = prepared;
+        failures.add('native schedule ownership remains unverified');
+        _trace(
+          '[alarm] native schedule outcome unverified; owned alarm retained id=${prepared.nativeAlarm?.id}',
+        );
+        return AlarmArmResult<T>(
+          succeeded: false,
+          confirmed: previous,
+          previousRetained: previous != null,
+          failures: List<String>.unmodifiable(failures),
+          transactionUnverified: true,
+        );
+      }
+      // A replacement may not silently downgrade an existing confirmed
+      // AlarmKit alarm. On legacy platforms, the completed notification
+      // cluster is the confirmed protection path.
+      final usable = useAlarmKit
+          ? prepared.hasConfirmedNativeAlarm
+          : previous?.hasConfirmedNativeAlarm == true
+          ? prepared.hasConfirmedNativeAlarm
+          : prepared.hasConfirmedNativeAlarm ||
+                prepared.hasNotificationFallback;
+      if (!usable) {
+        await _discard(prepared, failures);
+        if (previous != null) {
+          _trace('[alarm] replacement failed; previous retained');
+        }
+        return AlarmArmResult<T>(
+          succeeded: false,
+          confirmed: previous,
+          previousRetained: previous != null,
+          failures: List<String>.unmodifiable(failures),
+          transactionUnverified: _unresolvedNativeTransaction != null,
+        );
+      }
+
+      final preparedNative = prepared.nativeAlarm;
+      if (preparedNative?.backend == NativeAlarmBackend.alarmKit) {
+        final promotion = await _native.promoteSession(preparedNative!);
+        if (generation != _generation) {
+          await _discard(prepared, failures);
+          failures.add('arm superseded during native session promotion');
+          return AlarmArmResult<T>(
+            succeeded: false,
+            confirmed: confirmed,
+            previousRetained: confirmed != null,
+            failures: List<String>.unmodifiable(failures),
+            transactionUnverified: _unresolvedNativeTransaction != null,
+          );
+        }
+        if (!promotion.succeeded) {
+          failures.add('native session promotion: ${promotion.failure}');
+          if (promotion.isAmbiguous) {
+            final snapshot = await _native.sessionSnapshot();
+            if (snapshot.reconciliationAvailable &&
+                snapshot.lifecycleHealthy &&
+                snapshot.isProtected &&
+                snapshot.currentMatches(preparedNative)) {
+              _trace(
+                '[alarm] ambiguous promotion reconciled as committed id=${preparedNative.id}',
+              );
+            } else if (_snapshotProvesPreparedNotCommitted(
+              snapshot,
+              preparedNative,
+              previous?.nativeAlarm,
+            )) {
+              await _discard(prepared, failures);
+              if (previous != null) {
+                _trace('[alarm] replacement failed; previous retained');
+              }
+              return AlarmArmResult<T>(
+                succeeded: false,
+                confirmed: previous,
+                previousRetained: previous != null,
+                failures: List<String>.unmodifiable(failures),
+                transactionUnverified: _unresolvedNativeTransaction != null,
+              );
+            } else {
+              // The bridge may have lost the response after native commit.
+              // Keep both protection paths until explicit stop or restart.
+              _unresolvedNativeTransaction = prepared;
+              _trace(
+                '[alarm] promotion outcome unverified; prepared alarm retained id=${preparedNative.id}',
+              );
+              return AlarmArmResult<T>(
+                succeeded: false,
+                confirmed: previous,
+                previousRetained: false,
+                failures: List<String>.unmodifiable(failures),
+                transactionUnverified: true,
+              );
+            }
+          } else {
+            await _discard(prepared, failures);
+            if (previous != null) {
+              _trace('[alarm] replacement failed; previous retained');
+            }
+            return AlarmArmResult<T>(
+              succeeded: false,
+              confirmed: previous,
+              previousRetained: previous != null,
+              failures: List<String>.unmodifiable(failures),
+              transactionUnverified: _unresolvedNativeTransaction != null,
+            );
+          }
+        }
+      }
+
+      // Promote B before retiring A. Retirement failure can only leave
+      // duplicate protection; it cannot remove the newly confirmed alarm.
+      confirmed = prepared;
+      _unresolvedNativeTransaction = null;
       if (previous != null) {
-        _trace('[alarm] replacement failed; previous retained');
+        _trace(
+          '[alarm] replacement confirmed new=${prepared.nativeAlarm?.id ?? "fallback"}',
+        );
+        final remaining = await _retire(previous, failures);
+        if (remaining != null) {
+          _pendingNotificationCleanupIds.addAll(remaining.notificationIds);
+        }
+      }
+      if (failures.isNotEmpty) {
+        _trace(
+          '[alarm] arm confirmed with fallback warnings: ${failures.join("; ")}',
+        );
       }
       return AlarmArmResult<T>(
-        succeeded: false,
-        confirmed: previous,
-        previousRetained: previous != null,
+        succeeded: true,
+        confirmed: prepared,
+        previousRetained: false,
         failures: List<String>.unmodifiable(failures),
       );
-    }
-
-    // Promote B before retiring A. Retirement failure can only leave duplicate
-    // protection; it cannot remove the newly confirmed alarm.
-    confirmed = prepared;
-    if (previous != null) {
-      _trace(
-        '[alarm] replacement confirmed new=${prepared.nativeAlarm?.id ?? "fallback"}',
-      );
-      final remaining = await _retire(previous, failures);
-      if (remaining != null) {
-        _pendingNotificationCleanupIds.addAll(remaining.notificationIds);
+    } finally {
+      if (nativeTransaction != null) {
+        _finishNativeTransaction(nativeTransaction);
       }
     }
-    if (failures.isNotEmpty) {
-      _trace(
-        '[alarm] arm confirmed with fallback warnings: ${failures.join("; ")}',
-      );
-    }
-    return AlarmArmResult<T>(
-      succeeded: true,
-      confirmed: prepared,
-      previousRetained: false,
-      failures: List<String>.unmodifiable(failures),
-    );
   }
 
-  Future<AlarmStopResult> stop() async {
+  Future<AlarmStopResult> stop() {
+    final active = _activeStop;
+    if (active != null) return active;
+    final stopping = _stopAndRelease();
+    _activeStop = stopping;
+    return stopping;
+  }
+
+  Future<AlarmStopResult> _stopAndRelease() async {
+    try {
+      return await _stop();
+    } finally {
+      _activeStop = null;
+    }
+  }
+
+  Future<AlarmStopResult> _stop() async {
     final generation = ++_generation;
     final current = confirmed;
     final failures = <String>[];
@@ -556,6 +839,22 @@ class AlarmTransactionCoordinator<T> {
         stopAlerting: true,
         legacyRemoved: legacyRemoved,
       );
+    }
+    await _waitForNativeTransactions();
+    final unresolved = _unresolvedNativeTransaction;
+    if (unresolved != null &&
+        unresolved.nativeAlarm?.id != current?.nativeAlarm?.id) {
+      final unresolvedRemaining = await _retire(
+        unresolved,
+        failures,
+        stopAlerting: true,
+        legacyRemoved: legacyRemoved,
+      );
+      if (unresolvedRemaining == null) {
+        _unresolvedNativeTransaction = null;
+      } else {
+        _unresolvedNativeTransaction = unresolvedRemaining;
+      }
     }
     if (_pendingNotificationCleanupIds.isNotEmpty) {
       final pending = await _notifications.cancelIds(
@@ -575,29 +874,56 @@ class AlarmTransactionCoordinator<T> {
       succeeded:
           failures.isEmpty &&
           remaining == null &&
+          _unresolvedNativeTransaction == null &&
           _pendingNotificationCleanupIds.isEmpty,
       failures: List<String>.unmodifiable(failures),
     );
   }
 
-  Future<void> _discard(ConfirmedAlarm<T> alarm, List<String> failures) async {
-    if (alarm.notificationIds.isNotEmpty) {
-      final result = await _notifications.cancelIds(alarm.notificationIds);
-      if (!result.succeeded) {
-        failures.add('prepared notification rollback: ${result.failure}');
-        _pendingNotificationCleanupIds.addAll(result.remainingIds);
-      }
+  bool _snapshotProvesPreparedNotCommitted(
+    NativeAlarmSessionSnapshot snapshot,
+    NativeAlarmRecord prepared,
+    NativeAlarmRecord? previous,
+  ) {
+    if (!snapshot.reconciliationAvailable ||
+        !snapshot.lifecycleHealthy ||
+        !snapshot.preparedMatches(prepared) ||
+        !snapshot.isProtected) {
+      return false;
     }
-    if (alarm.nativeAlarm?.backend == NativeAlarmBackend.alarmKit) {
-      final result = await _native.cancel(alarm.nativeAlarm!.id);
-      if (!result.succeeded) {
-        failures.add('prepared native rollback: ${result.failure}');
-      }
-    } else if (alarm.nativeAlarm?.backend == NativeAlarmBackend.legacy) {
-      final result = await _native.stopLegacyPlayback();
-      if (!result.succeeded) {
-        failures.add('prepared legacy rollback: ${result.failure}');
-      }
+    if (previous == null || previous.backend != NativeAlarmBackend.alarmKit) {
+      return false;
+    }
+    return snapshot.currentMatches(previous);
+  }
+
+  Future<void> _discard(ConfirmedAlarm<T> alarm, List<String> failures) async {
+    final remaining = await _retire(alarm, failures);
+    if (remaining == null) return;
+    _pendingNotificationCleanupIds.addAll(remaining.notificationIds);
+    if (remaining.nativeAlarm != null) {
+      _unresolvedNativeTransaction = remaining;
+      _trace(
+        '[alarm] prepared cleanup unverified; owned alarm retained id=${remaining.nativeAlarm?.id}',
+      );
+    }
+  }
+
+  Completer<void> _beginNativeTransaction() {
+    final transaction = Completer<void>();
+    _nativeTransactions.add(transaction);
+    return transaction;
+  }
+
+  void _finishNativeTransaction(Completer<void> transaction) {
+    _nativeTransactions.remove(transaction);
+    if (!transaction.isCompleted) transaction.complete();
+  }
+
+  Future<void> _waitForNativeTransactions() async {
+    while (_nativeTransactions.isNotEmpty) {
+      final active = _nativeTransactions.toList(growable: false);
+      await Future.wait(active.map((transaction) => transaction.future));
     }
   }
 
@@ -612,13 +938,13 @@ class AlarmTransactionCoordinator<T> {
     if (native?.backend == NativeAlarmBackend.alarmKit) {
       AlarmOperationResult? stopResult;
       if (stopAlerting) {
-        stopResult = await _native.stopAlerting(native!.id);
+        stopResult = await _native.stopAlerting(native!);
         if (!stopResult.succeeded) {
           _trace('[alarm] native stop failed id=${native.id}');
         }
       }
       _trace('[alarm] native cancel requested id=${native!.id}');
-      final cancelResult = await _native.cancel(native.id);
+      final cancelResult = await _native.cancel(native);
       if (!cancelResult.succeeded) {
         _trace('[alarm] native cancel failed id=${native.id}');
         final query = await _native.alarms();

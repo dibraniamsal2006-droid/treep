@@ -11,11 +11,17 @@ import 'package:flutter_test/flutter_test.dart';
 import 'package:treep/main.dart';
 
 void main() {
-  testWidgets('Treep home screen renders basic controls', (WidgetTester tester) async {
+  testWidgets('Treep home screen renders basic controls', (
+    WidgetTester tester,
+  ) async {
     await tester.pumpWidget(const TreepApp());
 
     expect(find.byType(TextField), findsNWidgets(2));
-    expect(find.text('Start tracking'), findsOneWidget);
+    expect(find.text('Choose journey'), findsOneWidget);
+    expect(find.text('Alarm offset'), findsNothing);
+    expect(find.byKey(const Key('alarm-offset-slider')), findsNothing);
     expect(find.text('Test GTFS-RT feed'), findsOneWidget);
+    expect(find.textContaining('Test alarm'), findsNothing);
+    expect(find.byIcon(Icons.chevron_right_rounded), findsNothing);
   });
 }

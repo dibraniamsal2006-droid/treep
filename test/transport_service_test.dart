@@ -3,13 +3,17 @@ import 'dart:convert';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:gtfs_realtime_bindings/gtfs_realtime_bindings.dart';
 import 'package:http/http.dart' as http;
+import 'package:treep/models/trip_candidate.dart';
 import 'package:treep/services/transport_service.dart';
 
 void main() {
   group('fallback arrival timing', () {
     const destinationId = '8500207';
 
-    Future<List<dynamic>> runFallback(List<Map<String, dynamic>> items) async {
+    Future<List<dynamic>> runFallback(
+      List<Map<String, dynamic>> items, {
+      String trainQuery = 'IR55',
+    }) async {
       final service = TransportService(
         httpGet: (uri, {headers}) async {
           if (uri.path.endsWith('/locations')) {
@@ -27,7 +31,7 @@ void main() {
       );
 
       return service.fallbackArrivalsAtDestination(
-        trainQuery: 'IR55',
+        trainQuery: trainQuery,
         destStopIdCanons: const [destinationId],
         limit: 100,
       );
@@ -55,7 +59,7 @@ void main() {
     });
 
     test(
-      'departure prognosis is a fallback when arrival prognosis is absent',
+      'departure prognosis is not substituted for missing arrival prognosis',
       () async {
         final scheduled = DateTime.now().add(const Duration(hours: 2));
         final arrivals = await runFallback([
@@ -65,7 +69,117 @@ void main() {
           ),
         ]);
 
+        expect(arrivals.single.delaySeconds, 0);
+        expect(
+          arrivals.single.etaLocal.difference(scheduled).inSeconds.abs(),
+          lessThanOrEqualTo(1),
+        );
+      },
+    );
+
+    test(
+      '05:40-style journey keeps schedule without matching realtime',
+      () async {
+        final sharedMalformedRealtime = DateTime.now();
+        final scheduled = sharedMalformedRealtime.add(
+          const Duration(minutes: 15),
+        );
+        final arrivals = await runFallback([
+          _stationboardItem(
+            scheduled: scheduled,
+            scheduledInDepartureField: true,
+            prognosisArrival: sharedMalformedRealtime,
+            category: 'S',
+            number: '22',
+          ),
+        ], trainQuery: 'S22');
+
+        expect(arrivals, hasLength(1));
+        expect(
+          arrivals.single.etaLocal.difference(scheduled).inSeconds.abs(),
+          lessThanOrEqualTo(1),
+        );
+        expect(arrivals.single.delaySeconds, 0);
+      },
+    );
+
+    test(
+      '06:10-style journey keeps schedule without matching realtime',
+      () async {
+        final sharedMalformedRealtime = DateTime.now();
+        final scheduled = sharedMalformedRealtime.add(
+          const Duration(minutes: 45),
+        );
+        final arrivals = await runFallback([
+          _stationboardItem(
+            scheduled: scheduled,
+            scheduledInDepartureField: true,
+            prognosisArrival: sharedMalformedRealtime,
+            category: 'S',
+            number: '22',
+          ),
+        ], trainQuery: 'S22');
+
+        expect(arrivals, hasLength(1));
+        expect(
+          arrivals.single.etaLocal.difference(scheduled).inSeconds.abs(),
+          lessThanOrEqualTo(1),
+        );
+        expect(arrivals.single.delaySeconds, 0);
+      },
+    );
+
+    test('two S22 schedules do not collapse to one shared prognosis', () async {
+      final sharedMalformedRealtime = DateTime.now();
+      final first = sharedMalformedRealtime.add(const Duration(minutes: 15));
+      final second = sharedMalformedRealtime.add(const Duration(minutes: 45));
+      final arrivals = await runFallback([
+        _stationboardItem(
+          scheduled: first,
+          scheduledInDepartureField: true,
+          prognosisArrival: sharedMalformedRealtime,
+          category: 'S',
+          number: '22',
+        ),
+        _stationboardItem(
+          scheduled: second,
+          scheduledInDepartureField: true,
+          prognosisArrival: sharedMalformedRealtime,
+          category: 'S',
+          number: '22',
+        ),
+      ], trainQuery: 'S22');
+
+      expect(arrivals, hasLength(2));
+      expect(
+        arrivals[0].etaLocal.difference(first).inSeconds.abs(),
+        lessThanOrEqualTo(1),
+      );
+      expect(
+        arrivals[1].etaLocal.difference(second).inSeconds.abs(),
+        lessThanOrEqualTo(1),
+      );
+      expect(arrivals[0].etaLocal, isNot(arrivals[1].etaLocal));
+    });
+
+    test(
+      'matching departure prognosis remains a valid realtime update',
+      () async {
+        final scheduled = DateTime.now().add(const Duration(hours: 1));
+        final realtime = scheduled.add(const Duration(minutes: 4));
+        final arrivals = await runFallback([
+          _stationboardItem(
+            scheduled: scheduled,
+            scheduledInDepartureField: true,
+            prognosisDeparture: realtime,
+          ),
+        ]);
+
         expect(arrivals.single.delaySeconds, 4 * 60);
+        expect(
+          arrivals.single.etaLocal.difference(realtime).inSeconds.abs(),
+          lessThanOrEqualTo(1),
+        );
       },
     );
 
@@ -98,6 +212,24 @@ void main() {
       expect(arrivals.single.delaySeconds, 2 * 60 * 60);
     });
 
+    test('valid matching early arrival remains a negative delay', () async {
+      final scheduled = DateTime.now().add(const Duration(hours: 2));
+      final realtime = scheduled.subtract(const Duration(minutes: 3));
+      final arrivals = await runFallback([
+        _stationboardItem(scheduled: scheduled, prognosisArrival: realtime),
+      ]);
+
+      expect(arrivals, hasLength(1));
+      expect(
+        (arrivals.single.delaySeconds + 3 * 60).abs(),
+        lessThanOrEqualTo(1),
+      );
+      expect(
+        arrivals.single.etaLocal.difference(realtime).inSeconds.abs(),
+        lessThanOrEqualTo(1),
+      );
+    });
+
     test('valid delayed duplicate beats rejected extreme data', () async {
       final scheduled = DateTime.now().add(const Duration(hours: 2));
       final arrivals = await runFallback([
@@ -125,6 +257,131 @@ void main() {
 
       expect(arrivals, hasLength(2));
       expect(arrivals[0].tripId, isNot(arrivals[1].tripId));
+    });
+
+    test(
+      'delayed synthetic journey keeps its original scheduled identity',
+      () async {
+        final firstSchedule = DateTime.now().add(const Duration(hours: 1));
+        final secondSchedule = firstSchedule.add(const Duration(minutes: 30));
+        var items = <Map<String, dynamic>>[
+          _stationboardItem(scheduled: firstSchedule),
+          _stationboardItem(scheduled: secondSchedule),
+        ];
+        final service = TransportService(
+          httpGet: (uri, {headers}) async {
+            if (uri.path.endsWith('/locations')) {
+              return _jsonResponse({
+                'stations': [
+                  {'id': destinationId, 'name': 'Solothurn'},
+                ],
+              });
+            }
+            if (uri.path.endsWith('/stationboard')) {
+              return _jsonResponse({'stationboard': items});
+            }
+            return http.Response('not found', 404);
+          },
+        );
+        final initial = await service.fallbackArrivalsAtDestination(
+          trainQuery: 'IR55',
+          destStopIdCanons: const [destinationId],
+          limit: 100,
+        );
+        final selected = initial.first;
+        items = [
+          _stationboardItem(
+            scheduled: firstSchedule,
+            prognosisArrival: firstSchedule.add(const Duration(minutes: 31)),
+          ),
+          _stationboardItem(
+            scheduled: secondSchedule,
+            prognosisArrival: secondSchedule.add(const Duration(minutes: 1)),
+          ),
+        ];
+
+        final refreshed = await service.refreshCandidateEta(selected);
+
+        expect(refreshed, isNotNull);
+        expect(refreshed!.tripId, selected.tripId);
+        expect(refreshed.tripId, isNot(initial.last.tripId));
+        expect(
+          refreshed.etaLocal
+              .difference(firstSchedule.add(const Duration(minutes: 31)))
+              .inSeconds
+              .abs(),
+          lessThanOrEqualTo(1),
+        );
+      },
+    );
+
+    test(
+      'arrival pass list uses downstream terminal instead of S22 origin-side to',
+      () async {
+        final scheduled = DateTime.now().add(const Duration(hours: 2));
+        final candidate = await _runDirectionFallback(
+          trainQuery: 'S22',
+          destinationId: '8500212',
+          destinationName: 'Oensingen',
+          item: _arrivalDirectionItem(
+            scheduled: scheduled,
+            category: 'S',
+            number: '22',
+            originName: 'Balsthal',
+            destinationId: '8500212',
+            destinationName: 'Oensingen',
+            destinationLocationId: '8500294',
+          ),
+        );
+
+        expect(candidate.terminalStopId, 'Oensingen');
+        expect(candidate.directionSource, DirectionSource.stationboard);
+      },
+    );
+
+    test(
+      'arrival pass list uses downstream terminal instead of S20 origin-side to',
+      () async {
+        final scheduled = DateTime.now().add(const Duration(hours: 2));
+        final candidate = await _runDirectionFallback(
+          trainQuery: 'S20',
+          destinationId: '8500218',
+          destinationName: 'Olten',
+          item: _arrivalDirectionItem(
+            scheduled: scheduled,
+            category: 'S',
+            number: '20',
+            originName: 'Langendorf',
+            destinationId: '8500218',
+            destinationName: 'Olten',
+            destinationLocationId: '8500295',
+          ),
+        );
+
+        expect(candidate.terminalStopId, 'Olten');
+        expect(candidate.directionSource, DirectionSource.stationboard);
+      },
+    );
+
+    test('arrival pass list chooses its final serviced stop', () async {
+      final scheduled = DateTime.now().add(const Duration(hours: 2));
+      final candidate = await _runDirectionFallback(
+        trainQuery: 'S20',
+        destinationId: '8500218',
+        destinationName: 'Olten',
+        item: _arrivalDirectionItem(
+          scheduled: scheduled,
+          category: 'S',
+          number: '20',
+          originName: 'Langendorf',
+          destinationId: '8500218',
+          destinationName: 'Olten',
+          destinationLocationId: '8500295',
+          terminalName: 'Zürich HB',
+        ),
+      );
+
+      expect(candidate.terminalStopId, 'Zürich HB');
     });
   });
 
@@ -167,6 +424,14 @@ void main() {
               ),
               stopTimeUpdate: [
                 TripUpdate_StopTimeUpdate(
+                  stopSequence: 1,
+                  stopId: '8500001',
+                  departure: TripUpdate_StopTimeEvent.fromJson(
+                    '{"2":"${baseTime.subtract(const Duration(minutes: 10)).toUtc().millisecondsSinceEpoch ~/ 1000}"}',
+                  ),
+                ),
+                TripUpdate_StopTimeUpdate(
+                  stopSequence: 2,
                   stopId: stopId,
                   arrival: TripUpdate_StopTimeEvent.fromJson(
                     '{"2":"$etaSeconds"}',
@@ -190,6 +455,35 @@ void main() {
       expect(candidates.single.stopId, targetStopId);
     },
   );
+
+  test('stationboard fallback explicitly requests arrivals', () async {
+    Uri? stationboardRequest;
+    final service = TransportService(
+      httpGet: (uri, {headers}) async {
+        if (uri.path.endsWith('/locations')) {
+          return _jsonResponse({
+            'stations': const [
+              {'id': '8500207', 'name': 'Solothurn'},
+            ],
+          });
+        }
+        if (uri.path.endsWith('/stationboard')) {
+          stationboardRequest = uri;
+          return _jsonResponse({'stationboard': const <Object>[]});
+        }
+        return http.Response('not found', 404);
+      },
+    );
+
+    await service.fallbackArrivalsAtDestination(
+      trainQuery: 'IR55',
+      destStopIdCanons: const ['8500207'],
+      resolveDestinationName: false,
+    );
+
+    expect(stationboardRequest, isNotNull);
+    expect(stationboardRequest!.queryParameters['type'], 'arrival');
+  });
 
   group('destination stationboard stop recovery', () {
     const primaryId = '8501001';
@@ -468,10 +762,83 @@ http.Response _jsonResponse(Object body) {
   );
 }
 
+Future<TripCandidate> _runDirectionFallback({
+  required String trainQuery,
+  required String destinationId,
+  required String destinationName,
+  required Map<String, dynamic> item,
+}) async {
+  final service = TransportService(
+    httpGet: (uri, {headers}) async {
+      if (uri.path.endsWith('/locations')) {
+        return _jsonResponse({
+          'stations': [
+            {'id': destinationId, 'name': destinationName},
+          ],
+        });
+      }
+      if (uri.path.endsWith('/stationboard')) {
+        return _jsonResponse({
+          'stationboard': [item],
+        });
+      }
+      return http.Response('not found', 404);
+    },
+  );
+
+  final candidates = await service.fallbackArrivalsAtDestination(
+    trainQuery: trainQuery,
+    destStopIdCanons: [destinationId],
+    resolveDestinationName: false,
+  );
+  expect(candidates, hasLength(1));
+  return candidates.single;
+}
+
+Map<String, dynamic> _arrivalDirectionItem({
+  required DateTime scheduled,
+  required String category,
+  required String number,
+  required String originName,
+  required String destinationId,
+  required String destinationName,
+  required String destinationLocationId,
+  String? terminalName,
+}) {
+  final timestamp = scheduled.toUtc().millisecondsSinceEpoch ~/ 1000;
+  return {
+    'name': '$category $number',
+    'category': category,
+    'number': number,
+    // Arrival stationboards can expose the origin side here.
+    'to': originName,
+    'stop': {
+      'arrivalTimestamp': timestamp,
+      'station': {'id': destinationId, 'name': destinationName},
+      'location': {'id': destinationLocationId},
+      'prognosis': const <String, Object?>{},
+    },
+    'passList': [
+      {
+        'station': {'id': '8500998', 'name': originName},
+      },
+      {
+        'station': {'id': destinationLocationId, 'name': null},
+        'location': {'id': destinationLocationId},
+      },
+      if (terminalName != null)
+        {
+          'station': {'id': '8500999', 'name': terminalName},
+        },
+    ],
+  };
+}
+
 Map<String, dynamic> _stationboardItem({
   required DateTime scheduled,
   DateTime? prognosisArrival,
   DateTime? prognosisDeparture,
+  bool scheduledInDepartureField = false,
   String category = 'IR',
   String number = '55',
 }) {
@@ -481,7 +848,10 @@ Map<String, dynamic> _stationboardItem({
     'number': number,
     'to': 'Zürich HB',
     'stop': {
-      'arrivalTimestamp': scheduled.toUtc().millisecondsSinceEpoch ~/ 1000,
+      if (scheduledInDepartureField)
+        'departureTimestamp': scheduled.toUtc().millisecondsSinceEpoch ~/ 1000
+      else
+        'arrivalTimestamp': scheduled.toUtc().millisecondsSinceEpoch ~/ 1000,
       'station': {'id': '8500207', 'name': 'Solothurn'},
       'prognosis': {
         if (prognosisArrival != null)

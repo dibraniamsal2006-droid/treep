@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:convert';
 
 import 'package:flutter_test/flutter_test.dart';
 import 'package:http/http.dart' as http;
@@ -181,6 +182,173 @@ void main() {
     expect(records.single.journeyRef, 'journey-a');
     expect(records.single.operatingDayRef, '2026-08-28');
     expect(records.single.destinationText, 'Solothurn');
+    expect(records.single.hasPreviousServicedCall, isFalse);
+  });
+
+  test('StopEvent parser exposes an exact serviced PreviousCall as proof', () {
+    const xml = '''
+<OJP xmlns="http://www.vdv.de/ojp" xmlns:siri="http://www.siri.org.uk/siri">
+  <StopEventResult>
+    <StopEvent>
+      <PreviousCall>
+        <CallAtStop>
+          <siri:StopPointRef>ch:1:sloid:8500207</siri:StopPointRef>
+          <NotServicedStop>false</NotServicedStop>
+        </CallAtStop>
+      </PreviousCall>
+      <Service>
+        <siri:JourneyRef>journey-a</siri:JourneyRef>
+        <OperatingDayRef>2026-08-28</OperatingDayRef>
+        <DestinationText><Text>Solothurn</Text></DestinationText>
+      </Service>
+    </StopEvent>
+  </StopEventResult>
+</OJP>
+''';
+
+    final records = OjpStopEventClient.parseStopEventRecords(xml);
+
+    expect(records, hasLength(1));
+    expect(records.single.journeyRef, 'journey-a');
+    expect(records.single.operatingDayRef, '2026-08-28');
+    expect(records.single.hasPreviousServicedCall, isTrue);
+  });
+
+  test('a skipped OJP PreviousCall is not prior-call proof', () {
+    const xml = '''
+<OJP xmlns="http://www.vdv.de/ojp" xmlns:siri="http://www.siri.org.uk/siri">
+  <StopEventResult>
+    <StopEvent>
+      <PreviousCall>
+        <CallAtStop><NotServicedStop>true</NotServicedStop></CallAtStop>
+      </PreviousCall>
+      <Service>
+        <siri:JourneyRef>journey-a</siri:JourneyRef>
+        <OperatingDayRef>2026-08-28</OperatingDayRef>
+        <DestinationText><Text>Solothurn</Text></DestinationText>
+      </Service>
+    </StopEvent>
+  </StopEventResult>
+</OJP>
+''';
+
+    final records = OjpStopEventClient.parseStopEventRecords(xml);
+
+    expect(records.single.hasPreviousServicedCall, isFalse);
+  });
+
+  test('StopEvent request enables PreviousCall in the same request', () async {
+    Object? sentBody;
+    var calls = 0;
+    final client = OjpStopEventClient(
+      httpPost: (uri, {headers, body}) async {
+        calls++;
+        sentBody = body;
+        return http.Response('<OJP/>', 200);
+      },
+    );
+
+    await client.fetchStopEvents(
+      apiKey: 'test-key',
+      stopPointRef: 'ch:1:sloid:8500212',
+      from: DateTime.utc(2026, 8, 28, 10),
+      numberOfResults: 20,
+    );
+
+    expect(calls, 1);
+    expect(
+      sentBody.toString(),
+      contains('<IncludePreviousCalls>true</IncludePreviousCalls>'),
+    );
+  });
+
+  test('StopEvent parser exposes authoritative arrival candidate fields', () {
+    const xml = '''
+<OJP xmlns="http://www.vdv.de/ojp" xmlns:siri="http://www.siri.org.uk/siri">
+  <StopEventResult><StopEvent>
+    <PreviousCall><CallAtStop><NotServicedStop>false</NotServicedStop></CallAtStop></PreviousCall>
+    <ThisCall><CallAtStop>
+      <siri:StopPointRef>ch:1:sloid:212:0:880532</siri:StopPointRef>
+      <StopPointName><Text>Oensingen</Text></StopPointName>
+      <ServiceArrival>
+        <TimetabledTime>2026-08-29T16:40:00Z</TimetabledTime>
+        <EstimatedTime>2026-08-29T16:44:00Z</EstimatedTime>
+      </ServiceArrival>
+    </CallAtStop></ThisCall>
+    <Service>
+      <OperatingDayRef>2026-08-29</OperatingDayRef>
+      <JourneyRef>ch:1:sjyid:test</JourneyRef>
+      <PublishedServiceName><Text>S22</Text></PublishedServiceName>
+      <Mode><PtMode>rail</PtMode></Mode>
+      <DestinationText><Text>Oensingen</Text></DestinationText>
+    </Service>
+  </StopEvent></StopEventResult>
+</OJP>
+''';
+
+    final record = OjpStopEventClient.parseStopEventRecords(xml).single;
+
+    expect(record.stopPointRef, 'ch:1:sloid:212:0:880532');
+    expect(record.stopPointName, 'Oensingen');
+    expect(record.publicLineName, 'S22');
+    expect(record.transportMode, 'rail');
+    expect(record.scheduledArrival, DateTime.utc(2026, 8, 29, 16, 40));
+    expect(record.estimatedArrival, DateTime.utc(2026, 8, 29, 16, 44));
+    expect(record.hasPreviousServicedCall, isTrue);
+    expect(record.isDestinationServiced, isTrue);
+  });
+
+  test('Location parser scopes stop name and SLOID', () {
+    const xml = '''
+<OJP xmlns="http://www.vdv.de/ojp">
+  <PlaceResult><Place><StopPlace>
+    <StopPlaceRef>ch:1:sloid:212</StopPlaceRef>
+    <StopPlaceName><Text>Oensingen</Text></StopPlaceName>
+  </StopPlace></Place></PlaceResult>
+</OJP>
+''';
+
+    final record = OjpStopEventClient.parseLocationRecords(xml).single;
+
+    expect(record.name, 'Oensingen');
+    expect(record.stopPlaceRef, 'ch:1:sloid:212');
+  });
+
+  test('OJP HTTP boundary decodes UTF-8 station names exactly once', () async {
+    const xml = '''
+<OJP xmlns="http://www.vdv.de/ojp" xmlns:siri="http://www.siri.org.uk/siri">
+  <StopEventResult><StopEvent>
+    <ThisCall><CallAtStop>
+      <siri:StopPointRef>ch:1:sloid:212</siri:StopPointRef>
+      <StopPointName><Text>Oensingen, Bahnhof Süd</Text></StopPointName>
+    </CallAtStop></ThisCall>
+    <Service>
+      <JourneyRef>ch:1:sjyid:test</JourneyRef>
+      <OperatingDayRef>2026-08-29</OperatingDayRef>
+      <PublishedServiceName><Text>S20</Text></PublishedServiceName>
+      <DestinationText><Text>Zürich HB</Text></DestinationText>
+    </Service>
+  </StopEvent></StopEventResult>
+</OJP>
+''';
+    final client = OjpStopEventClient(
+      httpPost: (uri, {headers, body}) async => http.Response.bytes(
+        utf8.encode(xml),
+        200,
+        headers: const {'content-type': 'application/xml'},
+      ),
+    );
+
+    final record = (await client.fetchStopEvents(
+      apiKey: 'test-key',
+      stopPointRef: 'ch:1:sloid:212',
+      from: DateTime.utc(2026, 8, 29),
+      numberOfResults: 1,
+    )).single;
+
+    expect(record.stopPointName, 'Oensingen, Bahnhof Süd');
+    expect(record.destinationText, 'Zürich HB');
+    expect(record.stopPointName, isNot(contains('Ã')));
   });
 }
 
@@ -229,6 +397,7 @@ class _FakeOjpClient implements OjpPublicDirectionClient {
     required String stopPointRef,
     required DateTime from,
     required int numberOfResults,
+    OjpStopEventType eventType = OjpStopEventType.both,
   }) async {
     calls++;
     return records;
@@ -246,6 +415,7 @@ class _ThrowingOjpClient implements OjpPublicDirectionClient {
     required String stopPointRef,
     required DateTime from,
     required int numberOfResults,
+    OjpStopEventType eventType = OjpStopEventType.both,
   }) async {
     throw error;
   }

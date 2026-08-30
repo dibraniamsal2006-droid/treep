@@ -1,7 +1,6 @@
 import 'dart:async';
 import 'dart:convert';
 import 'dart:io' show Platform;
-import 'dart:math';
 
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
@@ -13,8 +12,10 @@ import 'package:shared_preferences/shared_preferences.dart';
 
 import '../models/trip_candidate.dart';
 import '../services/alarm_service.dart';
+import '../services/live_activity_service.dart';
 import '../services/matching_service.dart';
 import '../services/transport_service.dart';
+import 'active_journey_screen.dart';
 import 'settings_screen.dart';
 
 enum _PullUpFooterState { idle, loading, exhausted }
@@ -248,18 +249,37 @@ class TreepHome extends StatefulWidget {
     super.key,
     this.onPreferencesChanged,
     this.transportService,
+    this.alarmCoordinator,
+    this.liveActivityGateway,
+    this.confirmationDuration = treepConfirmationDuration,
   });
 
   final Future<void> Function()? onPreferencesChanged;
   final TransportService? transportService;
+  final AlarmTransactionCoordinator<TripCandidate>? alarmCoordinator;
+  final LiveActivityGateway? liveActivityGateway;
+  final Duration confirmationDuration;
 
   @override
   State<TreepHome> createState() => _TreepHomeState();
 }
 
+const Duration treepConfirmationDuration = Duration(milliseconds: 3750);
+const double wakeOffsetMinimumMinutes = 1;
+const double wakeOffsetMaximumMinutes = 15;
+const double wakeOffsetTrackInset = 24;
+
+double wakeOffsetNormalizedPosition(double value) {
+  return ((value - wakeOffsetMinimumMinutes) /
+          (wakeOffsetMaximumMinutes - wakeOffsetMinimumMinutes))
+      .clamp(0.0, 1.0);
+}
+
 class _TreepHomeState extends State<TreepHome> {
   final _trainController = TextEditingController();
   final _stationController = TextEditingController();
+  final _trainFocusNode = FocusNode(debugLabel: 'train-input');
+  final _stationFocusNode = FocusNode(debugLabel: 'destination-input');
   int _upcomingTripsLimit = 8; // how many upcoming connections to show
   int _upcomingWindowHours = 2;
   double _minutesBefore = 3;
@@ -274,37 +294,47 @@ class _TreepHomeState extends State<TreepHome> {
     1000000000,
   );
   DateTime? get _alarmFirstFire => _alarmCoordinator.confirmed?.fireTime;
-  bool get _nativeAlarmArmed =>
-      _alarmCoordinator.confirmed?.hasConfirmedNativeAlarm == true;
   // GTFS-RT plan is limited (e.g. 5 calls / minute). We throttle requests to avoid 429.
   // 5/min ~= 12s per call. Use 13s to be a little safer.
   Timer? _foregroundArmTimer;
   Timer? _ringTimer;
   Timer? _liveUpdateTimer;
-  Timer? _sliderDebounce;
+  int _liveRefreshGeneration = 0;
   int _rescheduleToken = 0;
   bool _isRescheduling = false;
   bool _isRinging = false;
   Timer? _selfTestStopper;
   Timer? _selfTestHapticTimer;
   bool _isSelfTesting = false;
-  final Random _rng = Random();
   DateTime? _lastAlarmUxAt;
 
   bool _sleepLinesEnabled = true;
-  bool _sleepOverlayShowing = false;
-  Timer? _sleepOverlayTimer;
   static const int _maxPickerHorizonHours = 6;
   late final TransportService _transportService;
+  late final LiveActivityGateway _liveActivityGateway;
+  late final bool _liveActivityEnabled;
+  String? _liveActivityId;
+  bool _showArmConfirmation = false;
+  bool _journeyPageActive = false;
+  bool _showActiveJourneyPage = false;
+  bool _isCancellingAlarm = false;
+  String? _cancellationMessage;
+  String _confirmationFlavor = '';
+  DateTime? _activeJourneyStartedAt;
+  DateTime? _activeAlarmFireTime;
+  String _selectedDestinationLabel = '';
+  int _confirmationGeneration = 0;
 
   @override
   void initState() {
     super.initState();
-    _alarmCoordinator = AlarmTransactionCoordinator<TripCandidate>(
-      native: _nativeAlarm,
-      notifications: const PluginAlarmNotificationGateway(),
-      nativeSchedulingEnabled: Platform.isIOS,
-    );
+    _alarmCoordinator =
+        widget.alarmCoordinator ??
+        AlarmTransactionCoordinator<TripCandidate>(
+          native: _nativeAlarm,
+          notifications: const PluginAlarmNotificationGateway(),
+          nativeSchedulingEnabled: Platform.isIOS,
+        );
     _transportService =
         widget.transportService ??
         TransportService(
@@ -312,7 +342,15 @@ class _TreepHomeState extends State<TreepHome> {
           traceCandidates: _traceStageCandidates,
           upcomingWindowHoursProvider: () => _upcomingWindowHours,
         );
+    _liveActivityGateway =
+        widget.liveActivityGateway ?? const MethodChannelLiveActivityGateway();
+    _liveActivityEnabled = Platform.isIOS || widget.liveActivityGateway != null;
+    _stationController.addListener(_refreshDestinationCopy);
     _loadPrefs();
+  }
+
+  void _refreshDestinationCopy() {
+    if (mounted) setState(() {});
   }
 
   Future<void> _loadPrefs() async {
@@ -344,122 +382,12 @@ class _TreepHomeState extends State<TreepHome> {
     await widget.onPreferencesChanged?.call();
   }
 
-  static const List<String> _sleepLines = <String>[
-    'Gute Nacht – Treep passt auf. 😴',
-    'Schlaf gut. Ich schrei dich rechtzeitig an. ⏰',
-    'Ayay Captain. Schlafmodus aktiviert. 🫡',
-    'Wir sehen uns, wenn du ankommst. 👀',
-    'Wenn du das hörst, bist du zu weit gefahren… Spaß. 😅',
-    'No worries – ich weck dich. 🙏',
-    'Train & Sleep – Mission gestartet. 🚆',
-    'Leg dich hin, ich mach den Rest. 💤',
-    'Bitte nicht schnarchen – der Zug hört mit. 🤫',
-    'Der nächste Halt gehört dir. 🧠',
-    'Alarm ist geladen. Schlaf jetzt. 🔋',
-    'Einmal kurz wegpennen – ich regel. ✅',
-    'Heute wird nicht verpasst. Versprochen. 🤝',
-    'Du pennst, ich tracke. Deal. 🤝',
-    'Gönn dir Schlaf – ich bin dein Backup. 🛟',
-  ];
+  static const String _confirmationSignature =
+      'Heute wird nicht verpasst. Versprochen. 🤝';
 
   String _pickSleepLine() {
     if (!_sleepLinesEnabled) return '';
-    return _sleepLines[_rng.nextInt(_sleepLines.length)];
-  }
-
-  Future<void> _showSleepLineOverlay(String line) async {
-    if (!_sleepLinesEnabled) return;
-    final text = line.trim();
-    if (text.isEmpty) return;
-    if (!mounted) return;
-    if (_sleepOverlayShowing) return;
-
-    _sleepOverlayShowing = true;
-
-    // Make sure we don't leak timers.
-    _sleepOverlayTimer?.cancel();
-
-    bool didAutoPop = false;
-
-    // Auto-close after a short time.
-    _sleepOverlayTimer = Timer(const Duration(seconds: 2), () {
-      if (!mounted) return;
-      if (didAutoPop) return;
-      didAutoPop = true;
-      // Only pop the root dialog route we opened (best-effort).
-      final nav = Navigator.of(context, rootNavigator: true);
-      if (nav.canPop()) nav.pop();
-    });
-
-    await showGeneralDialog<void>(
-      context: context,
-      useRootNavigator: true,
-      barrierDismissible: true,
-      barrierLabel: 'sleep_line',
-      barrierColor: Colors.black54,
-      transitionDuration: const Duration(milliseconds: 220),
-      pageBuilder: (ctx, a1, a2) {
-        return SafeArea(
-          child: Center(
-            child: Material(
-              color: Colors.transparent,
-              child: Container(
-                margin: const EdgeInsets.symmetric(horizontal: 22),
-                padding: const EdgeInsets.symmetric(
-                  horizontal: 18,
-                  vertical: 16,
-                ),
-                decoration: BoxDecoration(
-                  color: Theme.of(ctx).colorScheme.surface,
-                  borderRadius: BorderRadius.circular(16),
-                  boxShadow: const [
-                    BoxShadow(
-                      blurRadius: 22,
-                      offset: Offset(0, 10),
-                      color: Colors.black26,
-                    ),
-                  ],
-                ),
-                child: Row(
-                  mainAxisSize: MainAxisSize.min,
-                  children: [
-                    const Text('😴', style: TextStyle(fontSize: 26)),
-                    const SizedBox(width: 12),
-                    Flexible(
-                      child: Text(
-                        text,
-                        style: const TextStyle(
-                          fontSize: 16,
-                          height: 1.25,
-                          fontWeight: FontWeight.w600,
-                        ),
-                      ),
-                    ),
-                  ],
-                ),
-              ),
-            ),
-          ),
-        );
-      },
-      transitionBuilder: (ctx, anim, sec, child) {
-        final curved = CurvedAnimation(
-          parent: anim,
-          curve: Curves.easeOutCubic,
-        );
-        return FadeTransition(
-          opacity: curved,
-          child: ScaleTransition(
-            scale: Tween<double>(begin: 0.96, end: 1.0).animate(curved),
-            child: child,
-          ),
-        );
-      },
-    ).whenComplete(() {
-      _sleepOverlayTimer?.cancel();
-      _sleepOverlayTimer = null;
-      _sleepOverlayShowing = false;
-    });
+    return _confirmationSignature;
   }
 
   String _hhmm(DateTime dt) {
@@ -469,24 +397,29 @@ class _TreepHomeState extends State<TreepHome> {
   }
 
   // === TREEP: ALARM LOGIC START ===
-  Future<void> _stopAlarm() async {
+  Future<bool> _stopAlarm() async {
     _stopForegroundRing();
     _liveUpdateTimer?.cancel();
     _liveUpdateTimer = null;
-    _sliderDebounce?.cancel();
-    _sliderDebounce = null;
+    _liveRefreshGeneration++;
     _rescheduleToken++;
     _isRescheduling = false;
     final result = await _alarmCoordinator.stop();
     if (!result.succeeded) {
       debugPrint('[alarm] stop cleanup failed: ${result.failures.join("; ")}');
     }
-    if (!mounted) return;
+    if (!mounted) return result.succeeded;
     setState(() {
       if (!result.succeeded) {
         _trackingStatus = 'Alarm stopped; native cleanup needs checking.';
       }
     });
+    if (!result.succeeded && _alarmCoordinator.confirmed != null) {
+      _startLiveUpdates();
+      final fireTime = _alarmCoordinator.confirmed!.fireTime;
+      if (fireTime.isAfter(DateTime.now())) _startForegroundRing(fireTime);
+    }
+    return result.succeeded;
   }
 
   void _startForegroundRing(DateTime firstFire) {
@@ -535,7 +468,7 @@ class _TreepHomeState extends State<TreepHome> {
             TextButton(
               onPressed: () {
                 Navigator.of(context).pop();
-                _stopAlarm();
+                _cancelActiveAlarm();
               },
               child: const Text(
                 'STOP ALARM',
@@ -568,6 +501,7 @@ class _TreepHomeState extends State<TreepHome> {
 
   void _startLiveUpdates() {
     _liveUpdateTimer?.cancel();
+    _liveRefreshGeneration++;
     _liveUpdateTimer = Timer.periodic(const Duration(seconds: 25), (_) {
       _tickLiveUpdate();
     });
@@ -577,12 +511,19 @@ class _TreepHomeState extends State<TreepHome> {
     if (!mounted) return;
     final current = _selectedCandidate;
     if (current == null) return;
-    if (_alarmCoordinator.confirmed == null) return; // nur wenn armed
+    final confirmedAtStart = _alarmCoordinator.confirmed;
+    if (confirmedAtStart == null) return; // nur wenn armed
     if (_isRescheduling) return;
+    final refreshGeneration = ++_liveRefreshGeneration;
 
     try {
       final updated = await _refreshCandidateEta(current);
       if (!mounted) return;
+      if (refreshGeneration != _liveRefreshGeneration ||
+          !identical(_selectedCandidate, current) ||
+          !identical(_alarmCoordinator.confirmed, confirmedAtStart)) {
+        return;
+      }
       if (updated == null) return;
       _traceCandidate(
         'Live-update current',
@@ -636,9 +577,10 @@ class _TreepHomeState extends State<TreepHome> {
         showUx: false,
         requestPermissions: false,
       );
-      if (succeeded && mounted) {
+      if (succeeded && mounted && token == _rescheduleToken) {
         setState(() {
           _selectedCandidate = updated;
+          _activeAlarmFireTime = _alarmFirstFire;
           _trackingStatus =
               'Update: $reason — ETA ${_hhmm(updated.etaLocal)} (${_fmtDelay(updated.delaySeconds)})';
         });
@@ -647,6 +589,7 @@ class _TreepHomeState extends State<TreepHome> {
           updated,
           source: 'live-update-confirmed',
         );
+        await _synchronizeLiveActivity(updated);
       } else if (!succeeded) {
         debugPrint('[alarm] replacement failed; previous retained');
       }
@@ -667,15 +610,7 @@ class _TreepHomeState extends State<TreepHome> {
     bool showUx = true,
     bool requestPermissions = true,
   }) async {
-    final minsBefore = _minutesBefore.round();
-    final now = DateTime.now();
-    DateTime first = chosen.etaLocal.subtract(Duration(minutes: minsBefore));
-    // Give ourselves enough buffer so iOS scheduling never sees a "past" timestamp.
-    // 10s is still instant for the user, but avoids edge-case races.
-    final minFirst = now.add(const Duration(seconds: 10));
-    if (first.isBefore(minFirst)) {
-      first = minFirst;
-    }
+    final first = _plannedFirstFireFor(chosen);
 
     const interval = Duration(seconds: 45);
     const count = 12;
@@ -685,8 +620,8 @@ class _TreepHomeState extends State<TreepHome> {
 
     final title = 'TREEP ALARM';
     final body =
-        '${chosen.vehicleLabel}: ${chosen.displayTrain} → ${_terminalLabel(chosen)}\n'
-        'Your stop: ${_stopLabel(chosen.stopId)} • ETA ${_hhmm(chosen.etaLocal)}';
+        '${chosen.vehicleLabel}: ${_displayLineLabel(chosen)} → ${_displayDirectionLabel(chosen)}\n'
+        'Your stop: ${_displayDestinationLabel(chosen)} • ETA ${_hhmm(chosen.etaLocal)}';
 
     // UX (dialog + snackbar + sleep-line overlay) should only appear on explicit user action
     // and not more often than once every 30 seconds.
@@ -728,44 +663,308 @@ class _TreepHomeState extends State<TreepHome> {
 
     if (allowUx) {
       _lastAlarmUxAt = nowForUx;
-
-      // Friendly line (unique Treep vibe) — shown ONLY as overlay.
-      final sleepLine = _pickSleepLine();
-
-      // Kurze Bestätigung (SnackBar) – ohne Spruch (damit nichts doppelt vorkommt).
-      ScaffoldMessenger.of(context).hideCurrentSnackBar();
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(
-          content: Text('Alarm gesetzt für ${_hhmm(first)}.'),
-          duration: const Duration(seconds: 2),
-        ),
-      );
-
-      // Spruch als Overlay (abgedunkelter Hintergrund), geht automatisch weg.
-      // Post-frame, damit es zuverlässig über allem erscheint.
-      WidgetsBinding.instance.addPostFrameCallback((_) {
-        if (!mounted) return;
-        _showSleepLineOverlay(sleepLine);
-      });
     }
     return true;
   }
 
-  Future<void> _onMinutesBeforeChanged(double v) async {
+  DateTime _plannedFirstFireFor(TripCandidate chosen) {
+    return _plannedFirstFireForOffset(chosen, _minutesBefore.round());
+  }
+
+  DateTime _plannedFirstFireForOffset(TripCandidate chosen, int minutesBefore) {
+    final requested = chosen.etaLocal.subtract(
+      Duration(minutes: minutesBefore),
+    );
+    // Give iOS scheduling enough buffer to avoid a past timestamp race.
+    final minimum = DateTime.now().add(const Duration(seconds: 10));
+    return requested.isBefore(minimum) ? minimum : requested;
+  }
+
+  void _onMinutesBeforeChanged(double v) {
     if (!mounted) return;
+    final previous = _minutesBefore.round();
     setState(() => _minutesBefore = v);
+    if (previous != v.round()) HapticFeedback.selectionClick();
+  }
 
-    _sliderDebounce?.cancel();
-    _sliderDebounce = Timer(const Duration(milliseconds: 450), () async {
-      final c = _selectedCandidate;
-      if (c == null) return;
-      if (_alarmCoordinator.confirmed == null) return;
-
-      await _rescheduleAlarmWith(
-        c,
-        reason: 'Alarm-Vorlauf geändert (${_minutesBefore.round()}m)',
-      );
+  Future<void> _showConfirmationThenActiveJourney(TripCandidate chosen) async {
+    final generation = ++_confirmationGeneration;
+    HapticFeedback.mediumImpact();
+    if (!mounted) return;
+    setState(() {
+      _activeJourneyStartedAt ??= DateTime.now();
+      _activeAlarmFireTime = _alarmFirstFire;
+      _confirmationFlavor = _pickSleepLine();
+      _showArmConfirmation = true;
+      _cancellationMessage = null;
     });
+    await Future<void>.delayed(widget.confirmationDuration);
+    if (!mounted || generation != _confirmationGeneration) return;
+    setState(() {
+      _journeyPageActive = true;
+      _showActiveJourneyPage = true;
+    });
+    await Future<void>.delayed(const Duration(milliseconds: 460));
+    if (!mounted || generation != _confirmationGeneration) return;
+    setState(() => _showArmConfirmation = false);
+  }
+
+  Future<void> _armChosenCandidate(TripCandidate chosen) async {
+    final armed = await _armAlarmFor(chosen, showUx: true);
+    if (!mounted) return;
+    if (!armed) {
+      setState(() {
+        _trackingStatus =
+            'Alarm could not be confirmed. No Active Journey was opened.';
+      });
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text('Alarm could not be set. Please try again.'),
+        ),
+      );
+      return;
+    }
+    _activeJourneyStartedAt = DateTime.now();
+    await _synchronizeLiveActivity(chosen);
+    await _showConfirmationThenActiveJourney(chosen);
+  }
+
+  Future<void> _synchronizeLiveActivity(TripCandidate candidate) async {
+    if (!_liveActivityEnabled) return;
+    final confirmed = _alarmCoordinator.confirmed;
+    if (confirmed == null) return;
+    final native = confirmed.nativeAlarm;
+    final alarmTime = confirmed.fireTime;
+    final arrivalTime = candidate.etaLocal.isBefore(alarmTime)
+        ? alarmTime
+        : candidate.etaLocal;
+    final LiveActivityOperationResult result;
+    try {
+      result = await _liveActivityGateway
+          .startOrUpdate(
+            TreepLiveActivityContent(
+              journeyId: candidate.tripId.isNotEmpty
+                  ? candidate.tripId
+                  : '${candidate.routeId}|${candidate.startDate}|${candidate.startTime}',
+              lineLabel: _displayLineLabel(candidate),
+              destinationLabel: _displayDestinationLabel(candidate),
+              directionLabel: _displayDirectionLabel(candidate),
+              referenceTime: _activeJourneyStartedAt ?? DateTime.now(),
+              alarmTime: alarmTime,
+              arrivalTime: arrivalTime,
+              alarmId: native?.id,
+              alarmSessionId: native?.sessionId,
+              alarmRevision: native?.revision,
+            ),
+          )
+          .timeout(const Duration(seconds: 2));
+    } catch (error) {
+      debugPrint('[live-activity] synchronization failed: $error');
+      return;
+    }
+    if (result.succeeded) {
+      _liveActivityId = result.activityId;
+      debugPrint(
+        '[live-activity] ${result.action ?? "synchronized"} id=${result.activityId}',
+      );
+    } else {
+      debugPrint(
+        '[live-activity] unavailable supported=${result.supported} '
+        'enabled=${result.enabled} failure=${result.failure}',
+      );
+    }
+  }
+
+  Future<void> _endLiveActivity() async {
+    if (!_liveActivityEnabled) return;
+    final LiveActivityOperationResult result;
+    try {
+      result = await _liveActivityGateway.end().timeout(
+        const Duration(seconds: 2),
+      );
+    } catch (error) {
+      debugPrint('[live-activity] end failed: $error');
+      return;
+    }
+    if (result.succeeded) {
+      debugPrint('[live-activity] ended id=${_liveActivityId ?? "unknown"}');
+      _liveActivityId = null;
+    } else {
+      debugPrint('[live-activity] end failed: ${result.failure}');
+    }
+  }
+
+  Future<void> _reviewJourneyBeforeArming(TripCandidate chosen) async {
+    if (!mounted) return;
+    final shouldArm = await showModalBottomSheet<bool>(
+      context: context,
+      useSafeArea: true,
+      isScrollControlled: true,
+      backgroundColor: Colors.transparent,
+      barrierColor: Colors.black.withValues(alpha: 0.66),
+      builder: (sheetContext) {
+        var committing = false;
+        var reviewMinutesBefore = _minutesBefore;
+        final destination = _displayDestinationLabel(chosen);
+        final direction = treepDirectionPhrase(_displayDirectionLabel(chosen));
+        return StatefulBuilder(
+          builder: (sheetContext, setSheetState) {
+            final alarmTime = _plannedFirstFireForOffset(
+              chosen,
+              reviewMinutesBefore.round(),
+            );
+            return Container(
+              key: const Key('journey-review-sheet'),
+              decoration: const BoxDecoration(
+                color: treepSurfaceRaised,
+                borderRadius: BorderRadius.vertical(top: Radius.circular(28)),
+                border: Border(top: BorderSide(color: treepBorder)),
+              ),
+              padding: const EdgeInsets.fromLTRB(22, 11, 22, 22),
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                crossAxisAlignment: CrossAxisAlignment.stretch,
+                children: [
+                  Center(
+                    child: Container(
+                      width: 38,
+                      height: 5,
+                      decoration: BoxDecoration(
+                        color: const Color(0xFF5A625E),
+                        borderRadius: BorderRadius.circular(3),
+                      ),
+                    ),
+                  ),
+                  const SizedBox(height: 22),
+                  const Text(
+                    'Selected journey',
+                    style: TextStyle(
+                      color: Colors.white,
+                      fontSize: 21,
+                      fontWeight: FontWeight.w600,
+                      letterSpacing: -0.4,
+                    ),
+                  ),
+                  const SizedBox(height: 20),
+                  Row(
+                    children: [
+                      _LineBadge(
+                        key: const Key('review-line'),
+                        label: _displayLineLabel(chosen),
+                      ),
+                      const SizedBox(width: 12),
+                      Expanded(
+                        child: Text(
+                          direction,
+                          key: const Key('review-direction'),
+                          maxLines: 1,
+                          overflow: TextOverflow.ellipsis,
+                          style: const TextStyle(
+                            color: treepMuted,
+                            fontSize: 14,
+                            fontWeight: FontWeight.w500,
+                          ),
+                        ),
+                      ),
+                    ],
+                  ),
+                  const SizedBox(height: 14),
+                  Text(
+                    destination,
+                    key: const Key('review-destination'),
+                    maxLines: 2,
+                    overflow: TextOverflow.ellipsis,
+                    style: const TextStyle(
+                      color: Colors.white,
+                      fontSize: 22,
+                      fontWeight: FontWeight.w600,
+                      letterSpacing: -0.35,
+                    ),
+                  ),
+                  const SizedBox(height: 18),
+                  _ReviewRow(
+                    key: const Key('review-arrival-time'),
+                    label: 'Arrival',
+                    value: _hhmm(chosen.etaLocal),
+                  ),
+                  const Padding(
+                    padding: EdgeInsets.symmetric(vertical: 18),
+                    child: Divider(height: 1, color: treepBorder),
+                  ),
+                  _buildReviewOffsetControl(
+                    value: reviewMinutesBefore,
+                    onChanged: (value) {
+                      reviewMinutesBefore = value;
+                      _onMinutesBeforeChanged(value);
+                      setSheetState(() {});
+                    },
+                  ),
+                  const SizedBox(height: 15),
+                  _ReviewRow(
+                    key: const Key('review-alarm-time'),
+                    label: 'Alarm',
+                    value: _hhmm(alarmTime),
+                    accent: true,
+                  ),
+                  const SizedBox(height: 26),
+                  TreepPressableButton(
+                    key: const Key('review-set-alarm-button'),
+                    label: 'Set alarm',
+                    icon: Icons.alarm_rounded,
+                    onPressed: () {
+                      if (committing) return;
+                      committing = true;
+                      Navigator.of(sheetContext).pop(true);
+                    },
+                  ),
+                ],
+              ),
+            );
+          },
+        );
+      },
+    );
+    if (!mounted) return;
+    if (shouldArm != true) {
+      _cancelTrackingSelection('journey-review');
+      return;
+    }
+    await _armChosenCandidate(chosen);
+  }
+
+  Future<void> _cancelActiveAlarm() async {
+    if (_isCancellingAlarm) return;
+    HapticFeedback.lightImpact();
+    setState(() {
+      _isCancellingAlarm = true;
+      _cancellationMessage = null;
+    });
+    final stopped = await _stopAlarm();
+    if (!mounted) return;
+    if (!stopped) {
+      setState(() {
+        _isCancellingAlarm = false;
+        _cancellationMessage =
+            'Cancellation could not be fully confirmed. Protection remains visible while Treep keeps the lifecycle safe.';
+      });
+      return;
+    }
+    await _endLiveActivity();
+    if (!mounted) return;
+    setState(() {
+      _isCancellingAlarm = false;
+      _cancellationMessage = null;
+      _trackingStatus = 'Alarm cancelled.';
+    });
+    setState(() => _showActiveJourneyPage = false);
+    await Future<void>.delayed(const Duration(milliseconds: 430));
+    if (mounted) {
+      setState(() {
+        _journeyPageActive = false;
+        _activeAlarmFireTime = null;
+        _activeJourneyStartedAt = null;
+      });
+    }
   }
 
   Future<void> _runAlarmSelfTest() async {
@@ -1027,6 +1226,7 @@ class _TreepHomeState extends State<TreepHome> {
     if (!mounted) return;
     setState(() {
       _selectedCandidate = null;
+      _selectedDestinationLabel = '';
       _trackingStatus = 'Selection cancelled. No tracking was started.';
     });
   }
@@ -1233,6 +1433,65 @@ class _TreepHomeState extends State<TreepHome> {
     return _transportService.stopLabel(rawStopId);
   }
 
+  String _displayDestinationLabel(TripCandidate candidate) {
+    final canonical = _canonicalDestinationLabel(candidate);
+    if (canonical != null) return canonical;
+    final selected = _selectedDestinationLabel.trim();
+    if (selected.isNotEmpty &&
+        !RegExp(r'^\d+$').hasMatch(selected) &&
+        !MatchingService.looksTechnicalIdentifier(selected)) {
+      return selected;
+    }
+    final entered = _stationController.text.trim();
+    if (entered.isNotEmpty &&
+        !RegExp(r'^\d+$').hasMatch(entered) &&
+        !MatchingService.looksTechnicalIdentifier(entered)) {
+      return entered;
+    }
+    return _humanReadableStopLabel(candidate.stopId);
+  }
+
+  String _displayLineLabel(TripCandidate candidate) {
+    return MatchingService.publicServicePresentationLabel(
+      publicLine: candidate.displayTrain,
+      modeLabel: candidate.vehicleLabel,
+    );
+  }
+
+  String? _canonicalDestinationLabel(TripCandidate candidate) {
+    final resolved = _stopLabel(
+      candidate.stopId,
+    ).replaceFirst(RegExp(r'\s*\(\d+\)\s*$'), '').trim();
+    if (resolved.isEmpty ||
+        RegExp(r'^\d+$').hasMatch(resolved) ||
+        MatchingService.looksTechnicalIdentifier(resolved)) {
+      return null;
+    }
+    return resolved;
+  }
+
+  String _humanReadableStopLabel(String stopId) {
+    final resolved = _stopLabel(
+      stopId,
+    ).replaceFirst(RegExp(r'\s*\(\d+\)\s*$'), '').trim();
+    if (resolved.isNotEmpty && !RegExp(r'^\d+$').hasMatch(resolved)) {
+      if (!MatchingService.looksTechnicalIdentifier(resolved)) return resolved;
+    }
+    return 'Selected destination';
+  }
+
+  String _displayDirectionLabel(TripCandidate candidate) {
+    final label = _terminalLabel(
+      candidate,
+    ).replaceFirst(RegExp(r'\s*\(\d+\)\s*$'), '').trim();
+    if (label.isEmpty ||
+        RegExp(r'^\d+$').hasMatch(label) ||
+        MatchingService.looksTechnicalIdentifier(label)) {
+      return 'Direction unavailable';
+    }
+    return label;
+  }
+
   List<TripCandidate> _dedupeCandidatesViaService(List<TripCandidate> input) {
     return MatchingService.dedupeCandidates(
       input,
@@ -1367,7 +1626,11 @@ class _TreepHomeState extends State<TreepHome> {
           final list = [...e.value]
             ..sort((a, b) => a.etaLocal.compareTo(b.etaLocal));
           final first = list.first;
-          return (key: e.key, label: _terminalLabel(first), allItems: list);
+          return (
+            key: e.key,
+            label: _displayDirectionLabel(first),
+            allItems: list,
+          );
         })
         .toList();
 
@@ -1381,6 +1644,16 @@ class _TreepHomeState extends State<TreepHome> {
     final picked = await showModalBottomSheet<String>(
       context: context,
       showDragHandle: true,
+      useSafeArea: true,
+      isScrollControlled: true,
+      backgroundColor: treepSurfaceRaised,
+      barrierColor: Colors.black.withValues(alpha: 0.66),
+      shape: const RoundedRectangleBorder(
+        borderRadius: BorderRadius.vertical(top: Radius.circular(28)),
+      ),
+      constraints: BoxConstraints(
+        maxHeight: MediaQuery.sizeOf(context).height * 0.72,
+      ),
       builder: (ctx) {
         var loadedHours = initialWindowHours;
         List<({String key, String label, DateTime nextEta, int visibleCount})>
@@ -1465,41 +1738,92 @@ class _TreepHomeState extends State<TreepHome> {
               );
             }
 
-            return SafeArea(
-              child: ListView.separated(
-                physics: const BouncingScrollPhysics(
-                  parent: AlwaysScrollableScrollPhysics(),
-                ),
-                padding: const EdgeInsets.symmetric(vertical: 8),
-                itemCount: visibleOptions.length + 1,
-                separatorBuilder: (_, i) => i >= visibleOptions.length - 1
-                    ? const SizedBox.shrink()
-                    : const Divider(height: 1),
-                itemBuilder: (ctx, i) {
-                  if (i == visibleOptions.length) {
-                    return _buildLoadMoreFooter(
-                      state: footerState,
-                      idleText: 'Show later directions',
-                      loadingText: 'Loading later directions...',
-                      exhaustedText:
-                          'No more directions in the next $_maxPickerHorizonHours hours',
-                      onTap: () {
-                        _trace('Picker directions footer tapped');
-                        loadMore();
-                      },
-                    );
-                  }
-                  final o = visibleOptions[i];
-                  final mins = o.nextEta.difference(DateTime.now()).inMinutes;
-                  return ListTile(
-                    title: Text('→ ${o.label}'),
-                    subtitle: Text(
-                      'Next in ${mins}m • ${_hhmm(o.nextEta)} • ${o.visibleCount} upcoming',
+            return Column(
+              crossAxisAlignment: CrossAxisAlignment.stretch,
+              children: [
+                const Padding(
+                  padding: EdgeInsets.fromLTRB(22, 4, 22, 14),
+                  child: Text(
+                    'Choose direction',
+                    style: TextStyle(
+                      color: Colors.white,
+                      fontSize: 21,
+                      fontWeight: FontWeight.w600,
+                      letterSpacing: -0.4,
                     ),
-                    onTap: () => Navigator.of(ctx).pop(o.key),
-                  );
-                },
-              ),
+                  ),
+                ),
+                Expanded(
+                  child: ListView.separated(
+                    physics: const BouncingScrollPhysics(
+                      parent: AlwaysScrollableScrollPhysics(),
+                    ),
+                    padding: const EdgeInsets.only(bottom: 8),
+                    itemCount: visibleOptions.length + 1,
+                    separatorBuilder: (_, i) => i >= visibleOptions.length - 1
+                        ? const SizedBox.shrink()
+                        : const Divider(
+                            height: 1,
+                            indent: 22,
+                            endIndent: 22,
+                            color: treepBorder,
+                          ),
+                    itemBuilder: (ctx, i) {
+                      if (i == visibleOptions.length) {
+                        return _buildLoadMoreFooter(
+                          state: footerState,
+                          idleText: 'Show later directions',
+                          loadingText: 'Loading later directions...',
+                          exhaustedText:
+                              'No more directions in the next $_maxPickerHorizonHours hours',
+                          onTap: () {
+                            _trace('Picker directions footer tapped');
+                            loadMore();
+                          },
+                        );
+                      }
+                      final o = visibleOptions[i];
+                      final mins = o.nextEta
+                          .difference(DateTime.now())
+                          .inMinutes;
+                      return ListTile(
+                        key: Key('direction-choice-${o.key}'),
+                        contentPadding: const EdgeInsets.symmetric(
+                          horizontal: 22,
+                          vertical: 7,
+                        ),
+                        title: Text(
+                          treepDirectionPhrase(o.label),
+                          style: const TextStyle(
+                            color: Colors.white,
+                            fontSize: 17,
+                            fontWeight: FontWeight.w600,
+                          ),
+                        ),
+                        subtitle: Padding(
+                          padding: const EdgeInsets.only(top: 4),
+                          child: Text(
+                            'Next in $mins min · ${o.visibleCount} upcoming',
+                            style: const TextStyle(
+                              color: treepMuted,
+                              fontSize: 13,
+                            ),
+                          ),
+                        ),
+                        trailing: Text(
+                          _hhmm(o.nextEta),
+                          style: const TextStyle(
+                            color: Colors.white,
+                            fontSize: 18,
+                            fontWeight: FontWeight.w600,
+                          ),
+                        ),
+                        onTap: () => Navigator.of(ctx).pop(o.key),
+                      );
+                    },
+                  ),
+                ),
+              ],
             );
           },
         );
@@ -1532,6 +1856,16 @@ class _TreepHomeState extends State<TreepHome> {
     final picked = await showModalBottomSheet<TripCandidate>(
       context: context,
       showDragHandle: true,
+      useSafeArea: true,
+      isScrollControlled: true,
+      backgroundColor: treepSurfaceRaised,
+      barrierColor: Colors.black.withValues(alpha: 0.66),
+      shape: const RoundedRectangleBorder(
+        borderRadius: BorderRadius.vertical(top: Radius.circular(28)),
+      ),
+      constraints: BoxConstraints(
+        maxHeight: MediaQuery.sizeOf(context).height * 0.76,
+      ),
       builder: (ctx) {
         var loadedHours = initialWindowHours;
         List<TripCandidate> visibleConnectionsForHours(int hours) {
@@ -1590,44 +1924,71 @@ class _TreepHomeState extends State<TreepHome> {
               }
             }
 
-            return SafeArea(
-              child: ListView.separated(
-                physics: const BouncingScrollPhysics(
-                  parent: AlwaysScrollableScrollPhysics(),
-                ),
-                padding: const EdgeInsets.symmetric(vertical: 8),
-                itemCount: visibleConnections.length + 1,
-                separatorBuilder: (_, i) => i >= visibleConnections.length - 1
-                    ? const SizedBox.shrink()
-                    : const Divider(height: 1),
-                itemBuilder: (ctx, i) {
-                  if (i == visibleConnections.length) {
-                    return _buildLoadMoreFooter(
-                      state: footerState,
-                      idleText: 'Show more',
-                      loadingText: 'Loading more...',
-                      exhaustedText:
-                          'No more connections in the next $_maxPickerHorizonHours hours',
-                      onTap: () {
-                        _trace('Picker connections footer tapped');
-                        _trace(
-                          'Picker connections load triggered source=footer-tap',
-                        );
-                        loadMore();
-                      },
-                    );
-                  }
-                  final c = visibleConnections[i];
-                  final mins = c.etaLocal.difference(DateTime.now()).inMinutes;
-                  return ListTile(
-                    title: Text('${_hhmm(c.etaLocal)} (in ${mins}m)'),
-                    subtitle: Text(
-                      '${c.displayTrain} → ${_terminalLabel(c)} • ${_fmtDelay(c.delaySeconds)}',
+            return Column(
+              crossAxisAlignment: CrossAxisAlignment.stretch,
+              children: [
+                const Padding(
+                  padding: EdgeInsets.fromLTRB(22, 4, 22, 14),
+                  child: Text(
+                    'Choose journey',
+                    style: TextStyle(
+                      color: Colors.white,
+                      fontSize: 21,
+                      fontWeight: FontWeight.w600,
+                      letterSpacing: -0.4,
                     ),
-                    onTap: () => Navigator.of(ctx).pop(c),
-                  );
-                },
-              ),
+                  ),
+                ),
+                Expanded(
+                  child: ListView.separated(
+                    physics: const BouncingScrollPhysics(
+                      parent: AlwaysScrollableScrollPhysics(),
+                    ),
+                    padding: const EdgeInsets.only(bottom: 8),
+                    itemCount: visibleConnections.length + 1,
+                    separatorBuilder: (_, i) =>
+                        i >= visibleConnections.length - 1
+                        ? const SizedBox.shrink()
+                        : const Divider(
+                            height: 1,
+                            indent: 22,
+                            endIndent: 22,
+                            color: treepBorder,
+                          ),
+                    itemBuilder: (ctx, i) {
+                      if (i == visibleConnections.length) {
+                        return _buildLoadMoreFooter(
+                          state: footerState,
+                          idleText: 'Show more',
+                          loadingText: 'Loading more...',
+                          exhaustedText:
+                              'No more connections in the next $_maxPickerHorizonHours hours',
+                          onTap: () {
+                            _trace('Picker connections footer tapped');
+                            _trace(
+                              'Picker connections load triggered source=footer-tap',
+                            );
+                            loadMore();
+                          },
+                        );
+                      }
+                      final c = visibleConnections[i];
+                      final mins = c.etaLocal
+                          .difference(DateTime.now())
+                          .inMinutes;
+                      return _JourneyChoiceRow(
+                        key: Key('journey-choice-${c.tripId}'),
+                        line: _displayLineLabel(c),
+                        direction: _displayDirectionLabel(c),
+                        destination: _displayDestinationLabel(c),
+                        arrivalTime: _hhmm(c.etaLocal),
+                        relativeTime: 'in $mins min',
+                        onTap: () => Navigator.of(ctx).pop(c),
+                      );
+                    },
+                  ),
+                ),
+              ],
             );
           },
         );
@@ -1639,11 +2000,9 @@ class _TreepHomeState extends State<TreepHome> {
 
   @override
   void dispose() {
-    _sliderDebounce?.cancel();
-    _sliderDebounce = null;
-
     _liveUpdateTimer?.cancel();
     _liveUpdateTimer = null;
+    _liveRefreshGeneration++;
 
     _foregroundArmTimer?.cancel();
     _foregroundArmTimer = null;
@@ -1657,9 +2016,10 @@ class _TreepHomeState extends State<TreepHome> {
     _selfTestHapticTimer?.cancel();
     _selfTestHapticTimer = null;
 
-    _sleepOverlayTimer?.cancel();
-    _sleepOverlayTimer = null;
-
+    _confirmationGeneration++;
+    _stationController.removeListener(_refreshDestinationCopy);
+    _trainFocusNode.dispose();
+    _stationFocusNode.dispose();
     _trainController.dispose();
     _stationController.dispose();
     super.dispose();
@@ -1706,13 +2066,21 @@ class _TreepHomeState extends State<TreepHome> {
         );
 
         if (resolvedIds.isEmpty) {
+          final temporarilyUnavailable =
+              _transportService.lastStopResolutionFailure ==
+              StopResolutionFailure.temporaryUnavailable;
           setState(() {
-            _trackingStatus =
-                'Could not resolve “$destQuery”. Try a more specific name (e.g., “Zürich HB”) or enter the stop_id directly.';
+            _trackingStatus = temporarilyUnavailable
+                ? 'Transport data is temporarily unavailable. Please try again.'
+                : 'Could not resolve “$destQuery”. Try a more specific name (e.g., “Zürich HB”) or enter the stop_id directly.';
           });
           ScaffoldMessenger.of(context).showSnackBar(
-            const SnackBar(
-              content: Text('Destination could not be resolved.'),
+            SnackBar(
+              content: Text(
+                temporarilyUnavailable
+                    ? 'Transport data is temporarily unavailable.'
+                    : 'Destination could not be resolved.',
+              ),
               duration: Duration(seconds: 4),
             ),
           );
@@ -1767,13 +2135,21 @@ class _TreepHomeState extends State<TreepHome> {
         if (!mounted) return;
 
         if (arrivalCandidates.isEmpty) {
+          final temporarilyUnavailable =
+              _transportService.lastArrivalFallbackFailure ==
+              ArrivalFallbackFailure.temporaryUnavailable;
           setState(() {
-            _trackingStatus =
-                'No upcoming arrivals found. Try again in a moment or enter a specific line (e.g., “IC5”, “S2”).';
+            _trackingStatus = temporarilyUnavailable
+                ? 'Transport data is temporarily unavailable. Please try again.'
+                : 'No upcoming arrivals found. Try again in a moment or enter a specific line (e.g., “IC5”, “S2”).';
           });
           ScaffoldMessenger.of(context).showSnackBar(
-            const SnackBar(
-              content: Text('No upcoming arrivals found.'),
+            SnackBar(
+              content: Text(
+                temporarilyUnavailable
+                    ? 'Transport data is temporarily unavailable.'
+                    : 'No upcoming arrivals found.',
+              ),
               duration: Duration(seconds: 4),
             ),
           );
@@ -1865,18 +2241,12 @@ class _TreepHomeState extends State<TreepHome> {
           source: 'fallback-arrivals-no-train',
         );
 
-        late final TripCandidate chosen;
-        if (dirCandidates.length == 1) {
-          chosen = dirCandidates.first;
-        } else {
-          final picked = await _pickTripInDirectionBottomSheet(
-            candidates: dirCandidates,
-          );
-          if (picked == null) {
-            _cancelTrackingSelection('no-train-trip-picker');
-            return;
-          }
-          chosen = picked;
+        final chosen = await _pickTripInDirectionBottomSheet(
+          candidates: dirCandidates,
+        );
+        if (chosen == null) {
+          _cancelTrackingSelection('no-train-trip-picker');
+          return;
         }
         _traceCandidate(
           'Final-selection chosen',
@@ -1892,12 +2262,15 @@ class _TreepHomeState extends State<TreepHome> {
         // If not, could add logic here.
 
         final minsLeft = chosen.etaLocal.difference(DateTime.now()).inMinutes;
-        final niceStop = _stopLabel(chosen.stopId);
+        final niceStop =
+            _canonicalDestinationLabel(chosen) ??
+            (destWasName ? destQuery : _humanReadableStopLabel(chosen.stopId));
 
         setState(() {
           _selectedCandidate = chosen;
+          _selectedDestinationLabel = niceStop;
           _trackingStatus =
-              'Selected ${chosen.displayTrain} → $niceStop • ETA ${_hhmm(chosen.etaLocal)} (in ${minsLeft}m) • ${_fmtDelay(chosen.delaySeconds)}'
+              'Selected ${_displayLineLabel(chosen)} → $niceStop • ETA ${_hhmm(chosen.etaLocal)} (in ${minsLeft}m) • ${_fmtDelay(chosen.delaySeconds)}'
               '\n(Fallback: destination arrivals)';
         });
         _traceCandidate(
@@ -1906,11 +2279,7 @@ class _TreepHomeState extends State<TreepHome> {
           source: 'fallback-arrivals-no-train',
         );
 
-        await _armAlarmFor(chosen, showUx: false);
-        if (!mounted) return;
-        ScaffoldMessenger.of(context).showSnackBar(
-          const SnackBar(content: Text('Tracking set (foreground prototype).')),
-        );
+        await _reviewJourneyBeforeArming(chosen);
         return;
       } else {
         // trainQuery is NOT empty: use GTFS-RT logic as before.
@@ -2015,7 +2384,7 @@ class _TreepHomeState extends State<TreepHome> {
           });
 
           final broadArrivalCandidates = await _fallbackArrivalsAtDestination(
-            trainQuery: '',
+            trainQuery: trainQuery,
             destStopIdCanons: resolvedForFallback,
             destNameQuery: destWasName ? destQuery : null,
             limit: 220,
@@ -2285,6 +2654,9 @@ class _TreepHomeState extends State<TreepHome> {
 
           // If the user entered a train query, do NOT show all arrivals as fallback.
           if (trainQuery.trim().isNotEmpty) {
+            final temporarilyUnavailable =
+                _transportService.lastArrivalFallbackFailure ==
+                ArrivalFallbackFailure.temporaryUnavailable;
             _trace(
               'No matching trip found reason=train-path-empty queryNorm="${_normalizeTrainToken(trainQuery)}" '
               'strictMatch=$hadStrictMatch trainFallbackAttempted=$trainFallbackAttempted '
@@ -2293,12 +2665,17 @@ class _TreepHomeState extends State<TreepHome> {
             );
             _trace('Pipeline abort $scenarioTag stage=no-match');
             setState(() {
-              _trackingStatus =
-                  'No matching trip found (yet). Double-check the line/train name (e.g., “S3” not “S33”) or leave it empty to see all departures.';
+              _trackingStatus = temporarilyUnavailable
+                  ? 'Transport data is temporarily unavailable. Please try again.'
+                  : 'No matching trip found (yet). Double-check the line/train name (e.g., “S3” not “S33”) or leave it empty to see all departures.';
             });
             ScaffoldMessenger.of(context).showSnackBar(
-              const SnackBar(
-                content: Text('No matching trip found (yet).'),
+              SnackBar(
+                content: Text(
+                  temporarilyUnavailable
+                      ? 'Transport data is temporarily unavailable.'
+                      : 'No matching trip found (yet).',
+                ),
                 duration: Duration(seconds: 4),
               ),
             );
@@ -2417,19 +2794,14 @@ class _TreepHomeState extends State<TreepHome> {
           source: candidateSource,
         );
 
-        late TripCandidate chosen;
-        if (dirCandidates.length == 1) {
-          chosen = dirCandidates.first;
-        } else {
-          final picked = await _pickTripInDirectionBottomSheet(
-            candidates: dirCandidates,
-          );
-          if (picked == null) {
-            _cancelTrackingSelection('train-trip-picker');
-            return;
-          }
-          chosen = picked;
+        final pickedJourney = await _pickTripInDirectionBottomSheet(
+          candidates: dirCandidates,
+        );
+        if (pickedJourney == null) {
+          _cancelTrackingSelection('train-trip-picker');
+          return;
         }
+        var chosen = pickedJourney;
         _traceCandidate(
           'Final-selection chosen',
           chosen,
@@ -2462,12 +2834,15 @@ class _TreepHomeState extends State<TreepHome> {
         }
 
         final minsLeft = chosen.etaLocal.difference(DateTime.now()).inMinutes;
-        final niceStop = _stopLabel(chosen.stopId);
+        final niceStop =
+            _canonicalDestinationLabel(chosen) ??
+            (destWasName ? destQuery : _humanReadableStopLabel(chosen.stopId));
 
         setState(() {
           _selectedCandidate = chosen;
+          _selectedDestinationLabel = niceStop;
           _trackingStatus =
-              'Selected ${chosen.displayTrain} → $niceStop • ETA ${_hhmm(chosen.etaLocal)} (in ${minsLeft}m) • ${_fmtDelay(chosen.delaySeconds)}'
+              'Selected ${_displayLineLabel(chosen)} → $niceStop • ETA ${_hhmm(chosen.etaLocal)} (in ${minsLeft}m) • ${_fmtDelay(chosen.delaySeconds)}'
               '${usedArrivalsFallback ? "\n(Fallback: destination arrivals)" : ""}';
         });
         _traceCandidate(
@@ -2476,11 +2851,7 @@ class _TreepHomeState extends State<TreepHome> {
           source: candidateSource,
         );
 
-        await _armAlarmFor(chosen, showUx: false);
-        if (!mounted) return;
-        ScaffoldMessenger.of(context).showSnackBar(
-          const SnackBar(content: Text('Tracking set (foreground prototype).')),
-        );
+        await _reviewJourneyBeforeArming(chosen);
         return;
       }
     } catch (error, stackTrace) {
@@ -2736,174 +3107,611 @@ class _TreepHomeState extends State<TreepHome> {
   @override
   Widget build(BuildContext context) {
     final c = _selectedCandidate;
-    final hasAlarm = _alarmCoordinator.confirmed != null;
-
+    final fireTime = _activeAlarmFireTime ?? _alarmFirstFire;
+    final keyboardOpen = MediaQuery.viewInsetsOf(context).bottom > 0;
     return Scaffold(
-      body: SafeArea(
-        child: Center(
-          child: ConstrainedBox(
-            constraints: const BoxConstraints(maxWidth: 420),
-            child: SingleChildScrollView(
-              padding: const EdgeInsets.all(16),
-              child: Column(
-                crossAxisAlignment: CrossAxisAlignment.stretch,
-                children: [
-                  const SizedBox(height: 8),
-                  Row(
-                    mainAxisAlignment: MainAxisAlignment.spaceBetween,
+      backgroundColor: treepBackground,
+      body: LayoutBuilder(
+        builder: (context, constraints) {
+          final width = constraints.maxWidth;
+          return ClipRect(
+            child: Stack(
+              clipBehavior: Clip.hardEdge,
+              children: [
+                AnimatedPositioned(
+                  duration: const Duration(milliseconds: 460),
+                  curve: Curves.easeInOutCubic,
+                  left: _showActiveJourneyPage ? -width : 0,
+                  top: 0,
+                  width: width,
+                  height: constraints.maxHeight,
+                  child: IgnorePointer(
+                    ignoring: _showActiveJourneyPage,
+                    child: _buildHomePage(c, keyboardOpen: keyboardOpen),
+                  ),
+                ),
+                AnimatedPositioned(
+                  duration: const Duration(milliseconds: 430),
+                  curve: Curves.easeInOutCubic,
+                  left: _showActiveJourneyPage ? 0 : width,
+                  top: 0,
+                  width: width,
+                  height: constraints.maxHeight,
+                  child: IgnorePointer(
+                    ignoring: !_showActiveJourneyPage,
+                    child: _journeyPageActive && c != null && fireTime != null
+                        ? ActiveJourneyScreen(
+                            activatedAt:
+                                _activeJourneyStartedAt ?? DateTime.now(),
+                            alarmTime: fireTime,
+                            arrivalTime: c.etaLocal,
+                            lineLabel: _displayLineLabel(c),
+                            destinationLabel: _displayDestinationLabel(c),
+                            directionLabel: _displayDirectionLabel(c),
+                            isCancelling: _isCancellingAlarm,
+                            cancellationMessage: _cancellationMessage,
+                            onCancel: _cancelActiveAlarm,
+                          )
+                        : const ColoredBox(color: treepBackground),
+                  ),
+                ),
+              ],
+            ),
+          );
+        },
+      ),
+    );
+  }
+
+  Widget _buildHomePage(
+    TripCandidate? candidate, {
+    required bool keyboardOpen,
+  }) {
+    return ColoredBox(
+      color: treepBackground,
+      child: SafeArea(
+        child: Stack(
+          children: [
+            LayoutBuilder(
+              builder: (context, constraints) {
+                final textScale =
+                    MediaQuery.textScalerOf(context).scale(16) / 16;
+                final compact = constraints.maxHeight < 680;
+                final scrollingEnabled =
+                    keyboardOpen ||
+                    textScale > 1.3 ||
+                    constraints.maxHeight < 520 ||
+                    _trackingStatus.isNotEmpty;
+                final content = Padding(
+                  key: const Key('home-standard-layout'),
+                  padding: EdgeInsets.fromLTRB(
+                    22,
+                    compact ? 8 : 12,
+                    22,
+                    compact ? 8 : 18,
+                  ),
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.stretch,
                     children: [
-                      const SizedBox(width: 48),
-                      const Icon(Icons.terrain, size: 44),
-                      IconButton(
-                        tooltip: 'Settings',
-                        onPressed: _openSettings,
-                        icon: const Icon(Icons.settings),
-                      ),
-                    ],
-                  ),
-                  const SizedBox(height: 10),
-
-                  TextField(
-                    controller: _trainController,
-                    textCapitalization: TextCapitalization.characters,
-                    decoration: const InputDecoration(
-                      labelText: 'Train / line (optional, e.g., IC8)',
-                      prefixIcon: Icon(Icons.train),
-                      border: OutlineInputBorder(),
-                    ),
-                  ),
-                  const SizedBox(height: 10),
-
-                  TextField(
-                    controller: _stationController,
-                    decoration: const InputDecoration(
-                      labelText: 'Destination station (e.g., Olten)',
-                      prefixIcon: Icon(Icons.place_outlined),
-                      border: OutlineInputBorder(),
-                    ),
-                  ),
-                  const SizedBox(height: 12),
-
-                  Row(
-                    children: [
-                      const Text('Alarm before:'),
-                      const SizedBox(width: 12),
-                      Expanded(
-                        child: Slider(
-                          value: _minutesBefore,
-                          min: 1,
-                          max: 15,
-                          divisions: 14,
-                          onChanged: _onMinutesBeforeChanged,
-                        ),
-                      ),
-                      Text('${_minutesBefore.round()}m'),
-                    ],
-                  ),
-
-                  const SizedBox(height: 8),
-                  ElevatedButton(
-                    onPressed: _isStartingTracking ? null : _startTracking,
-                    child: Text(
-                      _isStartingTracking ? 'Starting…' : 'Start tracking',
-                    ),
-                  ),
-
-                  const SizedBox(height: 8),
-                  OutlinedButton(
-                    onPressed: _isTestingFeed ? null : _testFeed,
-                    child: const Text('Test GTFS-RT feed'),
-                  ),
-
-                  const SizedBox(height: 14),
-                  // === TREEP: STATUS UI START ===
-                  Container(
-                    padding: const EdgeInsets.all(14),
-                    decoration: BoxDecoration(
-                      borderRadius: BorderRadius.circular(12),
-                      border: Border.all(color: Theme.of(context).dividerColor),
-                    ),
-                    child: Column(
-                      crossAxisAlignment: CrossAxisAlignment.stretch,
-                      children: [
-                        const Text(
-                          'Status',
-                          style: TextStyle(fontWeight: FontWeight.bold),
-                        ),
-                        const SizedBox(height: 6),
-                        Text(_trackingStatus.isEmpty ? '—' : _trackingStatus),
-
-                        if (c != null) ...[
-                          const SizedBox(height: 10),
-                          Text('${c.vehicleLabel}: ${c.displayTrain}'),
-                          Text('Alarm at: ${_stopLabel(c.stopId)}'),
-                          Text('Direction: ${_terminalLabel(c)}'),
-                          Text(
-                            'Arrives: ${_hhmm(c.etaLocal)} • ${_fmtDelay(c.delaySeconds)}',
+                      Row(
+                        children: [
+                          Container(
+                            width: 38,
+                            height: 38,
+                            decoration: BoxDecoration(
+                              color: treepGreen.withValues(alpha: 0.12),
+                              borderRadius: BorderRadius.circular(12),
+                            ),
+                            child: const Icon(
+                              Icons.terrain_rounded,
+                              color: treepGreen,
+                              size: 24,
+                            ),
+                          ),
+                          const SizedBox(width: 11),
+                          const Text(
+                            'Treep',
+                            style: TextStyle(
+                              color: Colors.white,
+                              fontSize: 26,
+                              fontWeight: FontWeight.w700,
+                              letterSpacing: -0.8,
+                            ),
+                          ),
+                          const Spacer(),
+                          IconButton(
+                            tooltip: 'Settings',
+                            onPressed: _isStartingTracking
+                                ? null
+                                : _openSettings,
+                            style: IconButton.styleFrom(
+                              backgroundColor: treepSurface,
+                              foregroundColor: Colors.white,
+                              side: const BorderSide(color: treepBorder),
+                            ),
+                            icon: const Icon(Icons.settings_outlined, size: 20),
                           ),
                         ],
-
-                        if (hasAlarm) ...[
-                          const SizedBox(height: 10),
-                          Text(
-                            'Alarm: armed for ${_hhmm(_alarmFirstFire!)} (repeats until you stop)',
-                          ),
-                          Text(
-                            'Audio alarm: ${Platform.isIOS ? (_nativeAlarmArmed ? "ON" : "OFF (check iOS native)") : "(iOS only)"}',
-                          ),
-                        ],
-
-                        const SizedBox(height: 10),
-                        Column(
-                          crossAxisAlignment: CrossAxisAlignment.stretch,
-                          children: [
-                            Row(
-                              children: [
-                                Expanded(
-                                  child: ElevatedButton(
-                                    style: ElevatedButton.styleFrom(
-                                      backgroundColor: Colors.green,
-                                      foregroundColor: Colors.white,
-                                    ),
-                                    onPressed: c == null
-                                        ? null
-                                        : () => _armAlarmFor(c, showUx: true),
-                                    child: const Text('Set alarm'),
-                                  ),
-                                ),
-                                const SizedBox(width: 10),
-                                Expanded(
-                                  child: ElevatedButton(
-                                    style: ElevatedButton.styleFrom(
-                                      backgroundColor: Colors.red,
-                                      foregroundColor: Colors.white,
-                                    ),
-                                    onPressed: hasAlarm ? _stopAlarm : null,
-                                    child: const Text('Stop alarm'),
-                                  ),
-                                ),
-                              ],
+                      ),
+                      SizedBox(height: compact ? 14 : 42),
+                      Text(
+                        'Where are you going?',
+                        style: TextStyle(
+                          color: Colors.white,
+                          fontSize: compact ? 28 : 30,
+                          fontWeight: FontWeight.w600,
+                          letterSpacing: -1,
+                        ),
+                      ),
+                      const SizedBox(height: 8),
+                      const Text(
+                        'Choose your service and the station where you want to wake up.',
+                        style: TextStyle(
+                          color: treepMuted,
+                          fontSize: 15,
+                          height: 1.4,
+                        ),
+                      ),
+                      SizedBox(height: compact ? 12 : 28),
+                      _selectorField(
+                        key: const Key('train-selector'),
+                        controller: _trainController,
+                        label: 'Train / line',
+                        hint: 'Optional, e.g. S22',
+                        icon: Icons.train_rounded,
+                        capitalization: TextCapitalization.characters,
+                        compact: compact,
+                        inputKey: const Key('train-input'),
+                        focusNode: _trainFocusNode,
+                      ),
+                      SizedBox(height: compact ? 10 : 12),
+                      _selectorField(
+                        key: const Key('destination-selector'),
+                        controller: _stationController,
+                        label: 'Destination station',
+                        hint: 'e.g. Oensingen',
+                        icon: Icons.location_on_outlined,
+                        compact: compact,
+                        inputKey: const Key('destination-input'),
+                        focusNode: _stationFocusNode,
+                      ),
+                      if (_trackingStatus.isNotEmpty) ...[
+                        const SizedBox(height: 12),
+                        AnimatedSwitcher(
+                          duration: const Duration(milliseconds: 180),
+                          child: Text(
+                            _trackingStatus,
+                            key: ValueKey(_trackingStatus),
+                            textAlign: TextAlign.center,
+                            style: const TextStyle(
+                              color: treepMuted,
+                              fontSize: 13,
+                              height: 1.35,
                             ),
-                            const SizedBox(height: 8),
-                            OutlinedButton.icon(
-                              onPressed: _isSelfTesting
-                                  ? null
-                                  : _runAlarmSelfTest,
-                              icon: const Icon(Icons.volume_up_outlined),
-                              label: Text(
-                                _isSelfTesting ? 'Testing…' : 'Test alarm (3s)',
-                              ),
-                            ),
-                          ],
+                          ),
                         ),
                       ],
+                      SizedBox(height: compact ? 12 : 30),
+                      TreepPressableButton(
+                        key: const Key('choose-journey-button'),
+                        label: _isStartingTracking
+                            ? 'Finding journeys…'
+                            : 'Choose journey',
+                        icon: Icons.search_rounded,
+                        busy: _isStartingTracking,
+                        onPressed: _isStartingTracking ? null : _startTracking,
+                      ),
+                      SizedBox(height: compact ? 8 : 16),
+                      Wrap(
+                        alignment: WrapAlignment.center,
+                        children: [
+                          GestureDetector(
+                            onLongPress: kDebugMode && !_isSelfTesting
+                                ? _runAlarmSelfTest
+                                : null,
+                            child: TextButton(
+                              onPressed: _isTestingFeed ? null : _testFeed,
+                              style: compact
+                                  ? TextButton.styleFrom(
+                                      minimumSize: Size.zero,
+                                      padding: const EdgeInsets.symmetric(
+                                        horizontal: 8,
+                                        vertical: 8,
+                                      ),
+                                      tapTargetSize:
+                                          MaterialTapTargetSize.shrinkWrap,
+                                    )
+                                  : null,
+                              child: Text(
+                                _isTestingFeed
+                                    ? 'Testing feed…'
+                                    : 'Test GTFS-RT feed',
+                                style: const TextStyle(color: treepMuted),
+                              ),
+                            ),
+                          ),
+                        ],
+                      ),
+                    ],
+                  ),
+                );
+                return Center(
+                  child: ConstrainedBox(
+                    constraints: const BoxConstraints(maxWidth: 440),
+                    child: SingleChildScrollView(
+                      key: const Key('home-scroll-view'),
+                      physics: scrollingEnabled
+                          ? const ClampingScrollPhysics()
+                          : const NeverScrollableScrollPhysics(),
+                      keyboardDismissBehavior:
+                          ScrollViewKeyboardDismissBehavior.manual,
+                      child: content,
                     ),
                   ),
+                );
+              },
+            ),
+            if (_showArmConfirmation)
+              Positioned.fill(child: _buildConfirmation(candidate)),
+          ],
+        ),
+      ),
+    );
+  }
 
-                  // === TREEP: STATUS UI END ===
+  Widget _selectorField({
+    required Key key,
+    required TextEditingController controller,
+    required String label,
+    required String hint,
+    required IconData icon,
+    required Key inputKey,
+    required FocusNode focusNode,
+    TextCapitalization capitalization = TextCapitalization.none,
+    bool compact = false,
+  }) {
+    return Container(
+      key: key,
+      decoration: BoxDecoration(
+        color: treepSurface,
+        borderRadius: BorderRadius.circular(19),
+        border: Border.all(color: treepBorder),
+      ),
+      child: TextField(
+        key: inputKey,
+        controller: controller,
+        focusNode: focusNode,
+        enabled: !_isStartingTracking,
+        textCapitalization: capitalization,
+        style: const TextStyle(
+          color: Colors.white,
+          fontSize: 17,
+          fontWeight: FontWeight.w500,
+        ),
+        cursorColor: treepGreen,
+        decoration: InputDecoration(
+          labelText: label,
+          hintText: hint,
+          labelStyle: const TextStyle(color: treepMuted),
+          hintStyle: TextStyle(color: treepMuted.withValues(alpha: 0.7)),
+          prefixIcon: Icon(icon, color: treepGreen, size: 21),
+          border: InputBorder.none,
+          contentPadding: EdgeInsets.symmetric(vertical: compact ? 14 : 18),
+        ),
+      ),
+    );
+  }
+
+  Widget _buildReviewOffsetControl({
+    required double value,
+    required ValueChanged<double> onChanged,
+  }) {
+    final minutes = value.round();
+    return Column(
+      key: const Key('review-alarm-offset'),
+      children: [
+        Row(
+          children: [
+            const Icon(Icons.schedule_rounded, color: treepGreen, size: 21),
+            const SizedBox(width: 10),
+            const Expanded(
+              child: Text(
+                'Wake me',
+                maxLines: 1,
+                overflow: TextOverflow.ellipsis,
+                style: TextStyle(
+                  color: Colors.white,
+                  fontSize: 16,
+                  fontWeight: FontWeight.w600,
+                ),
+              ),
+            ),
+            const SizedBox(width: 8),
+            Flexible(
+              child: Text(
+                '$minutes min before',
+                key: const Key('alarm-offset-value'),
+                maxLines: 2,
+                textAlign: TextAlign.end,
+                style: const TextStyle(
+                  color: treepGreen,
+                  fontSize: 13,
+                  fontWeight: FontWeight.w600,
+                ),
+              ),
+            ),
+          ],
+        ),
+        SliderTheme(
+          data: SliderThemeData(
+            activeTrackColor: treepGreen,
+            inactiveTrackColor: const Color(0xFF303833),
+            thumbColor: Colors.white,
+            overlayColor: treepGreen.withValues(alpha: 0.12),
+            trackHeight: 4,
+            padding: const EdgeInsets.symmetric(
+              horizontal: wakeOffsetTrackInset,
+            ),
+          ),
+          child: Slider(
+            key: const Key('alarm-offset-slider'),
+            value: value,
+            min: wakeOffsetMinimumMinutes,
+            max: wakeOffsetMaximumMinutes,
+            divisions: 14,
+            onChanged: onChanged,
+          ),
+        ),
+        Padding(
+          padding: const EdgeInsets.symmetric(horizontal: wakeOffsetTrackInset),
+          child: SizedBox(
+            height: 16,
+            child: LayoutBuilder(
+              builder: (context, constraints) => Stack(
+                key: const Key('alarm-offset-label-track'),
+                clipBehavior: Clip.none,
+                children: [
+                  for (final mark in const <int>[1, 3, 5, 10, 15])
+                    Positioned(
+                      left:
+                          wakeOffsetNormalizedPosition(mark.toDouble()) *
+                          constraints.maxWidth,
+                      child: FractionalTranslation(
+                        translation: const Offset(-0.5, 0),
+                        child: Text(
+                          '$mark min',
+                          key: Key('alarm-offset-label-$mark'),
+                          style: const TextStyle(
+                            color: treepMuted,
+                            fontSize: 11,
+                          ),
+                        ),
+                      ),
+                    ),
                 ],
               ),
             ),
+          ),
+        ),
+      ],
+    );
+  }
+
+  Widget _buildConfirmation(TripCandidate? candidate) {
+    return ColoredBox(
+      color: treepBackground,
+      child: Center(
+        child: Padding(
+          padding: const EdgeInsets.symmetric(horizontal: 28),
+          child: TweenAnimationBuilder<double>(
+            tween: Tween(begin: 0.86, end: 1),
+            duration: const Duration(milliseconds: 520),
+            curve: Curves.easeOutBack,
+            builder: (context, scale, child) => Transform.scale(
+              scale: scale,
+              child: Opacity(opacity: scale.clamp(0, 1), child: child),
+            ),
+            child: Column(
+              key: const Key('alarm-confirmation'),
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                Container(
+                  width: 82,
+                  height: 82,
+                  decoration: BoxDecoration(
+                    color: treepGreen.withValues(alpha: 0.13),
+                    shape: BoxShape.circle,
+                    border: Border.all(
+                      color: treepGreen.withValues(alpha: 0.35),
+                    ),
+                  ),
+                  child: const Icon(
+                    Icons.check_rounded,
+                    color: treepGreen,
+                    size: 44,
+                  ),
+                ),
+                const SizedBox(height: 24),
+                const Text(
+                  'Alarm set',
+                  style: TextStyle(
+                    color: Colors.white,
+                    fontSize: 30,
+                    fontWeight: FontWeight.w600,
+                    letterSpacing: -0.8,
+                  ),
+                ),
+                const SizedBox(height: 10),
+                Text(
+                  "We'll wake you ${_minutesBefore.round()} min before arrival${candidate == null ? '.' : ' at ${_displayDestinationLabel(candidate)}.'}",
+                  textAlign: TextAlign.center,
+                  style: const TextStyle(
+                    color: treepMuted,
+                    fontSize: 15,
+                    height: 1.4,
+                  ),
+                ),
+                if (_confirmationFlavor.isNotEmpty) ...[
+                  const SizedBox(height: 23),
+                  Text(
+                    _confirmationFlavor,
+                    key: const Key('confirmation-flavor'),
+                    textAlign: TextAlign.center,
+                    style: const TextStyle(
+                      color: Color(0xFFAADDBE),
+                      fontSize: 13.5,
+                      fontWeight: FontWeight.w500,
+                      height: 1.35,
+                    ),
+                  ),
+                ],
+              ],
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+class _LineBadge extends StatelessWidget {
+  const _LineBadge({super.key, required this.label});
+
+  final String label;
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 9, vertical: 6),
+      decoration: BoxDecoration(
+        color: treepGreen.withValues(alpha: 0.13),
+        borderRadius: BorderRadius.circular(8),
+        border: Border.all(color: treepGreen.withValues(alpha: 0.2)),
+      ),
+      child: Text(
+        label,
+        style: const TextStyle(
+          color: treepGreen,
+          fontSize: 13,
+          fontWeight: FontWeight.w700,
+        ),
+      ),
+    );
+  }
+}
+
+class _ReviewRow extends StatelessWidget {
+  const _ReviewRow({
+    super.key,
+    required this.label,
+    required this.value,
+    this.accent = false,
+  });
+
+  final String label;
+  final String value;
+  final bool accent;
+
+  @override
+  Widget build(BuildContext context) {
+    return Row(
+      children: [
+        Text(label, style: const TextStyle(color: treepMuted, fontSize: 14)),
+        const Spacer(),
+        Text(
+          value,
+          textAlign: TextAlign.end,
+          style: TextStyle(
+            color: accent ? treepGreen : Colors.white,
+            fontSize: 16,
+            fontWeight: FontWeight.w600,
+          ),
+        ),
+      ],
+    );
+  }
+}
+
+class _JourneyChoiceRow extends StatelessWidget {
+  const _JourneyChoiceRow({
+    super.key,
+    required this.line,
+    required this.direction,
+    required this.destination,
+    required this.arrivalTime,
+    required this.relativeTime,
+    required this.onTap,
+  });
+
+  final String line;
+  final String direction;
+  final String destination;
+  final String arrivalTime;
+  final String relativeTime;
+  final VoidCallback onTap;
+
+  @override
+  Widget build(BuildContext context) {
+    return Material(
+      color: Colors.transparent,
+      child: InkWell(
+        onTap: onTap,
+        child: Padding(
+          padding: const EdgeInsets.symmetric(horizontal: 22, vertical: 15),
+          child: Row(
+            children: [
+              _LineBadge(label: line),
+              const SizedBox(width: 12),
+              Expanded(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text(
+                      treepDirectionPhrase(direction),
+                      key: const Key('journey-row-direction'),
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                      style: const TextStyle(
+                        color: treepMuted,
+                        fontSize: 13,
+                        fontWeight: FontWeight.w500,
+                      ),
+                    ),
+                    const SizedBox(height: 4),
+                    Text(
+                      'Arrival at $destination',
+                      key: const Key('journey-row-destination'),
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                      style: const TextStyle(
+                        color: Colors.white,
+                        fontSize: 16,
+                        fontWeight: FontWeight.w600,
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+              const SizedBox(width: 12),
+              Column(
+                crossAxisAlignment: CrossAxisAlignment.end,
+                children: [
+                  Text(
+                    arrivalTime,
+                    style: const TextStyle(
+                      color: Colors.white,
+                      fontSize: 18,
+                      fontWeight: FontWeight.w600,
+                    ),
+                  ),
+                  const SizedBox(height: 3),
+                  Text(
+                    relativeTime,
+                    style: const TextStyle(color: treepMuted, fontSize: 12),
+                  ),
+                ],
+              ),
+            ],
           ),
         ),
       ),

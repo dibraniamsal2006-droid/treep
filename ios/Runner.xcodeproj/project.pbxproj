@@ -12,6 +12,12 @@
 		3B3967161E833CAA004F5970 /* AppFrameworkInfo.plist in Resources */ = {isa = PBXBuildFile; fileRef = 3B3967151E833CAA004F5970 /* AppFrameworkInfo.plist */; };
 		5585E597F6A5DA90FA1729A8 /* Pods_RunnerTests.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 0C902E84075FF7793708000B /* Pods_RunnerTests.framework */; };
 		74858FAF1ED2DC5600515810 /* AppDelegate.swift in Sources */ = {isa = PBXBuildFile; fileRef = 74858FAE1ED2DC5600515810 /* AppDelegate.swift */; };
+		A14200012F51A00100C0D3E1 /* TreepAlarmSessionCoordinator.swift in Sources */ = {isa = PBXBuildFile; fileRef = A14200002F51A00100C0D3E1 /* TreepAlarmSessionCoordinator.swift */; };
+		A14300102F52000100C0D3E1 /* TreepJourneyActivityAttributes.swift in Sources */ = {isa = PBXBuildFile; fileRef = A14300002F52000100C0D3E1 /* TreepJourneyActivityAttributes.swift */; };
+		A14300112F52000100C0D3E1 /* TreepLiveActivityBridge.swift in Sources */ = {isa = PBXBuildFile; fileRef = A14300012F52000100C0D3E1 /* TreepLiveActivityBridge.swift */; };
+		A14300122F52000100C0D3E1 /* TreepJourneyActivityAttributes.swift in Sources */ = {isa = PBXBuildFile; fileRef = A14300002F52000100C0D3E1 /* TreepJourneyActivityAttributes.swift */; };
+		A14300132F52000100C0D3E1 /* TreepLiveActivity.swift in Sources */ = {isa = PBXBuildFile; fileRef = A14300022F52000100C0D3E1 /* TreepLiveActivity.swift */; };
+		A14300142F52000100C0D3E1 /* TreepLiveActivity.appex in Embed App Extensions */ = {isa = PBXBuildFile; fileRef = A14300042F52000100C0D3E1 /* TreepLiveActivity.appex */; settings = {ATTRIBUTES = (CodeSignOnCopy, RemoveHeadersOnCopy, ); }; };
 		97C146FC1CF9000F007C117D /* Main.storyboard in Resources */ = {isa = PBXBuildFile; fileRef = 97C146FA1CF9000F007C117D /* Main.storyboard */; };
 		97C146FE1CF9000F007C117D /* Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = 97C146FD1CF9000F007C117D /* Assets.xcassets */; };
 		97C147011CF9000F007C117D /* LaunchScreen.storyboard in Resources */ = {isa = PBXBuildFile; fileRef = 97C146FF1CF9000F007C117D /* LaunchScreen.storyboard */; };
@@ -21,6 +27,13 @@
 /* End PBXBuildFile section */
 
 /* Begin PBXContainerItemProxy section */
+		A14300422F52000100C0D3E1 /* PBXContainerItemProxy */ = {
+			isa = PBXContainerItemProxy;
+			containerPortal = 97C146E61CF9000F007C117D /* Project object */;
+			proxyType = 1;
+			remoteGlobalIDString = A14300402F52000100C0D3E1;
+			remoteInfo = TreepLiveActivity;
+		};
 		331C8085294A63A400263BE5 /* PBXContainerItemProxy */ = {
 			isa = PBXContainerItemProxy;
 			containerPortal = 97C146E61CF9000F007C117D /* Project object */;
@@ -31,6 +44,17 @@
 /* End PBXContainerItemProxy section */
 
 /* Begin PBXCopyFilesBuildPhase section */
+		A14300332F52000100C0D3E1 /* Embed App Extensions */ = {
+			isa = PBXCopyFilesBuildPhase;
+			buildActionMask = 2147483647;
+			dstPath = "";
+			dstSubfolderSpec = 13;
+			files = (
+				A14300142F52000100C0D3E1 /* TreepLiveActivity.appex in Embed App Extensions */,
+			);
+			name = "Embed App Extensions";
+			runOnlyForDeploymentPostprocessing = 0;
+		};
 		9705A1C41CF9048500538489 /* Embed Frameworks */ = {
 			isa = PBXCopyFilesBuildPhase;
 			buildActionMask = 2147483647;
@@ -54,6 +78,13 @@
 		61CE4FF35D800E5174AC8282 /* Pods-RunnerTests.release.xcconfig */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = text.xcconfig; name = "Pods-RunnerTests.release.xcconfig"; path = "Target Support Files/Pods-RunnerTests/Pods-RunnerTests.release.xcconfig"; sourceTree = "<group>"; };
 		74858FAD1ED2DC5600515810 /* Runner-Bridging-Header.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = "Runner-Bridging-Header.h"; sourceTree = "<group>"; };
 		74858FAE1ED2DC5600515810 /* AppDelegate.swift */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.swift; path = AppDelegate.swift; sourceTree = "<group>"; };
+		A14200002F51A00100C0D3E1 /* TreepAlarmSessionCoordinator.swift */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.swift; path = TreepAlarmSessionCoordinator.swift; sourceTree = "<group>"; };
+		A14300002F52000100C0D3E1 /* TreepJourneyActivityAttributes.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TreepJourneyActivityAttributes.swift; sourceTree = "<group>"; };
+		A14300012F52000100C0D3E1 /* TreepLiveActivityBridge.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TreepLiveActivityBridge.swift; sourceTree = "<group>"; };
+		A14300022F52000100C0D3E1 /* TreepLiveActivity.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TreepLiveActivity.swift; sourceTree = "<group>"; };
+		A14300032F52000100C0D3E1 /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = Info.plist; sourceTree = "<group>"; };
+		A14300042F52000100C0D3E1 /* TreepLiveActivity.appex */ = {isa = PBXFileReference; explicitFileType = "wrapper.app-extension"; includeInIndex = 0; path = TreepLiveActivity.appex; sourceTree = BUILT_PRODUCTS_DIR; };
+		A14300052F52000100C0D3E1 /* TreepLiveActivity.xcconfig */ = {isa = PBXFileReference; lastKnownFileType = text.xcconfig; path = TreepLiveActivity.xcconfig; sourceTree = "<group>"; };
 		7AFA3C8E1D35360C0083082E /* Release.xcconfig */ = {isa = PBXFileReference; lastKnownFileType = text.xcconfig; name = Release.xcconfig; path = Flutter/Release.xcconfig; sourceTree = "<group>"; };
 		960085DC0EEC5F80937AD60B /* Pods-Runner.profile.xcconfig */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = text.xcconfig; name = "Pods-Runner.profile.xcconfig"; path = "Target Support Files/Pods-Runner/Pods-Runner.profile.xcconfig"; sourceTree = "<group>"; };
 		9740EEB21CF90195004384FC /* Debug.xcconfig */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = text.xcconfig; name = Debug.xcconfig; path = Flutter/Debug.xcconfig; sourceTree = "<group>"; };
@@ -72,6 +103,13 @@
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
+		A14300312F52000100C0D3E1 /* Frameworks */ = {
+			isa = PBXFrameworksBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
 		2B06BB8DE9B166AE843A0F48 /* Frameworks */ = {
 			isa = PBXFrameworksBuildPhase;
 			buildActionMask = 2147483647;
@@ -91,6 +129,24 @@
 /* End PBXFrameworksBuildPhase section */
 
 /* Begin PBXGroup section */
+		A14300202F52000100C0D3E1 /* Shared */ = {
+			isa = PBXGroup;
+			children = (
+				A14300002F52000100C0D3E1 /* TreepJourneyActivityAttributes.swift */,
+			);
+			path = Shared;
+			sourceTree = "<group>";
+		};
+		A14300212F52000100C0D3E1 /* TreepLiveActivity */ = {
+			isa = PBXGroup;
+			children = (
+				A14300022F52000100C0D3E1 /* TreepLiveActivity.swift */,
+				A14300032F52000100C0D3E1 /* Info.plist */,
+				A14300052F52000100C0D3E1 /* TreepLiveActivity.xcconfig */,
+			);
+			path = TreepLiveActivity;
+			sourceTree = "<group>";
+		};
 		24351164D4B4634BD65DD88B /* Frameworks */ = {
 			isa = PBXGroup;
 			children = (
@@ -123,6 +179,8 @@
 			isa = PBXGroup;
 			children = (
 				9EF681AD2EF2C4EA0043E273 /* alarm.wav */,
+				A14300202F52000100C0D3E1 /* Shared */,
+				A14300212F52000100C0D3E1 /* TreepLiveActivity */,
 				9740EEB11CF90186004384FC /* Flutter */,
 				97C146F01CF9000F007C117D /* Runner */,
 				97C146EF1CF9000F007C117D /* Products */,
@@ -138,6 +196,7 @@
 			children = (
 				97C146EE1CF9000F007C117D /* Runner.app */,
 				331C8081294A63A400263BE5 /* RunnerTests.xctest */,
+				A14300042F52000100C0D3E1 /* TreepLiveActivity.appex */,
 			);
 			name = Products;
 			sourceTree = "<group>";
@@ -152,6 +211,8 @@
 				1498D2321E8E86230040F4C2 /* GeneratedPluginRegistrant.h */,
 				1498D2331E8E89220040F4C2 /* GeneratedPluginRegistrant.m */,
 				74858FAE1ED2DC5600515810 /* AppDelegate.swift */,
+				A14200002F51A00100C0D3E1 /* TreepAlarmSessionCoordinator.swift */,
+				A14300012F52000100C0D3E1 /* TreepLiveActivityBridge.swift */,
 				74858FAD1ED2DC5600515810 /* Runner-Bridging-Header.h */,
 			);
 			path = Runner;
@@ -173,6 +234,23 @@
 /* End PBXGroup section */
 
 /* Begin PBXNativeTarget section */
+		A14300402F52000100C0D3E1 /* TreepLiveActivity */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = A14300532F52000100C0D3E1 /* Build configuration list for PBXNativeTarget "TreepLiveActivity" */;
+			buildPhases = (
+				A14300302F52000100C0D3E1 /* Sources */,
+				A14300312F52000100C0D3E1 /* Frameworks */,
+				A14300322F52000100C0D3E1 /* Resources */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+			);
+			name = TreepLiveActivity;
+			productName = TreepLiveActivity;
+			productReference = A14300042F52000100C0D3E1 /* TreepLiveActivity.appex */;
+			productType = "com.apple.product-type.app-extension";
+		};
 		331C8080294A63A400263BE5 /* RunnerTests */ = {
 			isa = PBXNativeTarget;
 			buildConfigurationList = 331C8087294A63A400263BE5 /* Build configuration list for PBXNativeTarget "RunnerTests" */;
@@ -202,12 +280,14 @@
 				97C146EB1CF9000F007C117D /* Frameworks */,
 				97C146EC1CF9000F007C117D /* Resources */,
 				9705A1C41CF9048500538489 /* Embed Frameworks */,
+				A14300332F52000100C0D3E1 /* Embed App Extensions */,
 				3B06AD1E1E4923F5004D2608 /* Thin Binary */,
 				CE71A1F7617E219A22C34435 /* [CP] Embed Pods Frameworks */,
 			);
 			buildRules = (
 			);
 			dependencies = (
+				A14300412F52000100C0D3E1 /* PBXTargetDependency */,
 			);
 			name = Runner;
 			productName = Runner;
@@ -224,6 +304,9 @@
 				LastUpgradeCheck = 1510;
 				ORGANIZATIONNAME = "";
 				TargetAttributes = {
+					A14300402F52000100C0D3E1 = {
+						CreatedOnToolsVersion = 26.1;
+					};
 					331C8080294A63A400263BE5 = {
 						CreatedOnToolsVersion = 14.0;
 						TestTargetID = 97C146ED1CF9000F007C117D;
@@ -249,11 +332,19 @@
 			targets = (
 				97C146ED1CF9000F007C117D /* Runner */,
 				331C8080294A63A400263BE5 /* RunnerTests */,
+				A14300402F52000100C0D3E1 /* TreepLiveActivity */,
 			);
 		};
 /* End PBXProject section */
 
 /* Begin PBXResourcesBuildPhase section */
+		A14300322F52000100C0D3E1 /* Resources */ = {
+			isa = PBXResourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
 		331C807F294A63A400263BE5 /* Resources */ = {
 			isa = PBXResourcesBuildPhase;
 			buildActionMask = 2147483647;
@@ -372,6 +463,15 @@
 /* End PBXShellScriptBuildPhase section */
 
 /* Begin PBXSourcesBuildPhase section */
+		A14300302F52000100C0D3E1 /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				A14300122F52000100C0D3E1 /* TreepJourneyActivityAttributes.swift in Sources */,
+				A14300132F52000100C0D3E1 /* TreepLiveActivity.swift in Sources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
 		331C807D294A63A400263BE5 /* Sources */ = {
 			isa = PBXSourcesBuildPhase;
 			buildActionMask = 2147483647;
@@ -385,6 +485,9 @@
 			buildActionMask = 2147483647;
 			files = (
 				74858FAF1ED2DC5600515810 /* AppDelegate.swift in Sources */,
+				A14200012F51A00100C0D3E1 /* TreepAlarmSessionCoordinator.swift in Sources */,
+				A14300102F52000100C0D3E1 /* TreepJourneyActivityAttributes.swift in Sources */,
+				A14300112F52000100C0D3E1 /* TreepLiveActivityBridge.swift in Sources */,
 				1498D2341E8E89220040F4C2 /* GeneratedPluginRegistrant.m in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
@@ -392,6 +495,11 @@
 /* End PBXSourcesBuildPhase section */
 
 /* Begin PBXTargetDependency section */
+		A14300412F52000100C0D3E1 /* PBXTargetDependency */ = {
+			isa = PBXTargetDependency;
+			target = A14300402F52000100C0D3E1 /* TreepLiveActivity */;
+			targetProxy = A14300422F52000100C0D3E1 /* PBXContainerItemProxy */;
+		};
 		331C8086294A63A400263BE5 /* PBXTargetDependency */ = {
 			isa = PBXTargetDependency;
 			target = 97C146ED1CF9000F007C117D /* Runner */;
@@ -419,6 +527,88 @@
 /* End PBXVariantGroup section */
 
 /* Begin XCBuildConfiguration section */
+		A14300502F52000100C0D3E1 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			baseConfigurationReference = A14300052F52000100C0D3E1 /* TreepLiveActivity.xcconfig */;
+			buildSettings = {
+				APPLICATION_EXTENSION_API_ONLY = YES;
+				CODE_SIGN_STYLE = Automatic;
+				CURRENT_PROJECT_VERSION = "$(FLUTTER_BUILD_NUMBER)";
+				DEVELOPMENT_TEAM = 7WBX53SWBS;
+				GENERATE_INFOPLIST_FILE = NO;
+				INFOPLIST_FILE = TreepLiveActivity/Info.plist;
+				IPHONEOS_DEPLOYMENT_TARGET = 16.2;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+					"@executable_path/../../Frameworks",
+				);
+				MARKETING_VERSION = "$(FLUTTER_BUILD_NAME)";
+				PRODUCT_BUNDLE_IDENTIFIER = com.amsal.treep.TreepLiveActivity;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SKIP_INSTALL = YES;
+				SUPPORTED_PLATFORMS = "iphoneos iphonesimulator";
+				SWIFT_ACTIVE_COMPILATION_CONDITIONS = DEBUG;
+				SWIFT_OPTIMIZATION_LEVEL = "-Onone";
+				SWIFT_VERSION = 5.0;
+				TARGETED_DEVICE_FAMILY = "1,2";
+			};
+			name = Debug;
+		};
+		A14300512F52000100C0D3E1 /* Release */ = {
+			isa = XCBuildConfiguration;
+			baseConfigurationReference = A14300052F52000100C0D3E1 /* TreepLiveActivity.xcconfig */;
+			buildSettings = {
+				APPLICATION_EXTENSION_API_ONLY = YES;
+				CODE_SIGN_STYLE = Automatic;
+				CURRENT_PROJECT_VERSION = "$(FLUTTER_BUILD_NUMBER)";
+				DEVELOPMENT_TEAM = 7WBX53SWBS;
+				GENERATE_INFOPLIST_FILE = NO;
+				INFOPLIST_FILE = TreepLiveActivity/Info.plist;
+				IPHONEOS_DEPLOYMENT_TARGET = 16.2;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+					"@executable_path/../../Frameworks",
+				);
+				MARKETING_VERSION = "$(FLUTTER_BUILD_NAME)";
+				PRODUCT_BUNDLE_IDENTIFIER = com.amsal.treep.TreepLiveActivity;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SKIP_INSTALL = YES;
+				SUPPORTED_PLATFORMS = "iphoneos iphonesimulator";
+				SWIFT_COMPILATION_MODE = wholemodule;
+				SWIFT_VERSION = 5.0;
+				TARGETED_DEVICE_FAMILY = "1,2";
+			};
+			name = Release;
+		};
+		A14300522F52000100C0D3E1 /* Profile */ = {
+			isa = XCBuildConfiguration;
+			baseConfigurationReference = A14300052F52000100C0D3E1 /* TreepLiveActivity.xcconfig */;
+			buildSettings = {
+				APPLICATION_EXTENSION_API_ONLY = YES;
+				CODE_SIGN_STYLE = Automatic;
+				CURRENT_PROJECT_VERSION = "$(FLUTTER_BUILD_NUMBER)";
+				DEVELOPMENT_TEAM = 7WBX53SWBS;
+				GENERATE_INFOPLIST_FILE = NO;
+				INFOPLIST_FILE = TreepLiveActivity/Info.plist;
+				IPHONEOS_DEPLOYMENT_TARGET = 16.2;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+					"@executable_path/../../Frameworks",
+				);
+				MARKETING_VERSION = "$(FLUTTER_BUILD_NAME)";
+				PRODUCT_BUNDLE_IDENTIFIER = com.amsal.treep.TreepLiveActivity;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SKIP_INSTALL = YES;
+				SUPPORTED_PLATFORMS = "iphoneos iphonesimulator";
+				SWIFT_COMPILATION_MODE = wholemodule;
+				SWIFT_VERSION = 5.0;
+				TARGETED_DEVICE_FAMILY = "1,2";
+			};
+			name = Profile;
+		};
 		249021D3217E4FDB00AE95B9 /* Profile */ = {
 			isa = XCBuildConfiguration;
 			buildSettings = {
@@ -702,6 +892,16 @@
 /* End XCBuildConfiguration section */
 
 /* Begin XCConfigurationList section */
+		A14300532F52000100C0D3E1 /* Build configuration list for PBXNativeTarget "TreepLiveActivity" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				A14300502F52000100C0D3E1 /* Debug */,
+				A14300512F52000100C0D3E1 /* Release */,
+				A14300522F52000100C0D3E1 /* Profile */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
 		331C8087294A63A400263BE5 /* Build configuration list for PBXNativeTarget "RunnerTests" */ = {
 			isa = XCConfigurationList;
 			buildConfigurations = (
